@@ -1,0 +1,1380 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>office-f4</title>
+<style>
+  html,body{margin:0;height:100%;background:#17140f;overflow:hidden}
+  canvas{display:block;touch-action:none;cursor:grab}
+  canvas.drag{cursor:grabbing}
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+globalThis.DIORAMA_TEXTURE=Object.assign({"dotVar": 0.3, "dotJit": 0.3, "speckle": 0.3, "angleSpread": 0, "cell": 0.8},globalThis.DIORAMA_TEXTURE||{});
+'use strict';
+/* ==========================================================================
+   DIORAMA RUNTIME  —  a printed isometric room
+   Part 1: numbers, geometry, and the press.
+   ========================================================================== */
+const TAU=Math.PI*2;
+
+/* --- seeded randomness: every mark is deterministic, so art never re-rolls --- */
+function mul32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+function hmix(h,v){h=Math.imul(h^(v|0),0x85EBCA6B);h^=h>>>13;h=Math.imul(h,0xC2B2AE35);return(h^(h>>>16))>>>0}
+function strHash(s){let h=0x811C9DC5;for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return h>>>0}
+function streamOf(...ks){let h=0x9E3779B9;for(const k of ks)h=hmix(h,typeof k==='string'?strHash(k):k);const f=mul32(h);for(let i=0;i<11;i++)f();return f}
+const rd=(R,a,b)=>a+R()*(b-a);
+const ri=(R,a,b)=>Math.floor(rd(R,a,b+1));
+const ch=(R,p)=>R()<p;
+const pk=(R,arr)=>arr[(R()*arr.length)|0];
+
+/* --- easing: the whole choreography language is sstep + bump --- */
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,t)=>a+(b-a)*t;
+const sm=t=>t*t*(3-2*t);
+const sstep=(a,b,t)=>sm(clamp((t-a)/((b-a)||1),0,1));   // ramp 0->1 between times a and b
+const bump=(a,b,u)=>u<=a||u>=b?0:Math.sin((u-a)/(b-a)*Math.PI); // 0->1->0 between a and b
+const fract=v=>v-Math.floor(v);
+const tri=t=>1-Math.abs(fract(t)*2-1);
+
+/* --- polygons. every drawable is an array of [x,y] --- */
+const rect=(x0,y0,x1,y1)=>[[x0,y0],[x1,y0],[x1,y1],[x0,y1]];
+const ell=(x,y,rx,ry,n=24)=>{const P=[];for(let k=0;k<n;k++){const a=k/n*TAU;P.push([x+Math.cos(a)*rx,y+Math.sin(a)*ry])}return P};
+const circ=(x,y,r,n=24)=>ell(x,y,r,r,n);
+const arcPts=(x,y,rx,ry,a0,a1,n=12)=>{const P=[];for(let k=0;k<=n;k++){const a=lerp(a0,a1,k/n);P.push([x+Math.cos(a)*rx,y+Math.sin(a)*ry])}return P};
+const lerpP=(a,b,t)=>[lerp(a[0],b[0],t),lerp(a[1],b[1],t)];
+const bbox=P=>{let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity;for(const p of P){if(p[0]<x0)x0=p[0];if(p[0]>x1)x1=p[0];if(p[1]<y0)y0=p[1];if(p[1]>y1)y1=p[1]}return[x0,y0,x1,y1]};
+const centroid=P=>{let x=0,y=0;for(const p of P){x+=p[0];y+=p[1]}return[x/P.length,y/P.length]};
+const sc=(P,cx,cy,k)=>P.map(p=>[cx+(p[0]-cx)*k,cy+(p[1]-cy)*k]);
+const tr=(P,dx,dy)=>P.map(p=>[p[0]+dx,p[1]+dy]);
+const rotPts=(P,cx,cy,a)=>P.map(p=>{const dx=p[0]-cx,dy=p[1]-cy;return[cx+dx*Math.cos(a)-dy*Math.sin(a),cy+dx*Math.sin(a)+dy*Math.cos(a)]});
+function pip(P,x,y){let c=false;for(let i=0,j=P.length-1;i<P.length;j=i++){const a=P[i],b=P[j];
+if((a[1]>y)!==(b[1]>y)&&x<(b[0]-a[0])*(y-a[1])/((b[1]-a[1])||1e-9)+a[0])c=!c}return c}
+function resample(pts,step){
+if(pts.length<2)return pts.slice();
+const out=[[pts[0][0],pts[0][1]]];let need=step;
+for(let i=1;i<pts.length;i++){
+let x0=pts[i-1][0],y0=pts[i-1][1];const x1=pts[i][0],y1=pts[i][1];
+let d=Math.hypot(x1-x0,y1-y0);
+while(d>=need&&d>0){const t=need/d;x0+=(x1-x0)*t;y0+=(y1-y0)*t;out.push([x0,y0]);d-=need;need=step}
+need-=d}
+const L=pts[pts.length-1];out.push([L[0],L[1]]);return out}
+function chaikin(P,n=2,closed=false){
+for(let k=0;k<n;k++){const q=[];const m=P.length;
+if(!closed)q.push(P[0]);
+for(let i=0;i<(closed?m:m-1);i++){const a=P[i],b=P[(i+1)%m];
+q.push([a[0]*.75+b[0]*.25,a[1]*.75+b[1]*.25],[a[0]*.25+b[0]*.75,a[1]*.25+b[1]*.75])}
+if(!closed)q.push(P[m-1]);P=q}return P}
+const curve=(P,n=2)=>chaikin(P,n,false);
+const loop=(P,n=2)=>chaikin(P,n,true);
+function ribbon(pts,w){
+const n=pts.length,L=[],Rr=[];
+for(let i=0;i<n;i++){const a=pts[Math.max(0,i-1)],b=pts[Math.min(n-1,i+1)];
+let nx=-(b[1]-a[1]),ny=b[0]-a[0];const d=Math.hypot(nx,ny)||1;nx/=d;ny/=d;
+const ww=(typeof w==='function'?w(n>1?i/(n-1):0):w)/2;
+L.push([pts[i][0]+nx*ww,pts[i][1]+ny*ww]);Rr.push([pts[i][0]-nx*ww,pts[i][1]-ny*ww])}
+return L.concat(Rr.reverse())}
+
+/* --- the isometric projection. this is the entire "3D". ---
+   i runs south-east, j runs south-west, z runs up. 2:1 dimetric. */
+const TW=64,TH=32,TZ=32;
+const isoX=(i,j)=>(i-j)*(TW/2);
+const isoY=(i,j,z)=>(i+j)*(TH/2)-(z||0)*TZ;
+
+/* --- the press: five plates, screen angles, misregistration --- */
+const PAPER=[243,235,221];
+const INK={blue:[52,74,128],coral:[238,104,82],sun:[255,212,40],teal:[0,140,138],paper:PAPER};
+const INK_NAMES=['blue','coral','sun','teal','paper'];
+const SCREEN={blue:15,coral:75,sun:0,teal:45,paper:45};        // halftone angle per plate
+const PLATE={blue:[.55,-.3],coral:[-.6,.45],sun:[.35,.75],teal:[-.45,-.55],paper:[0,0]}; // plate slip
+const CELLW=3.1,PAT_K=5,PAT_CELLS=8,TONE_LEVELS=20;
+const TEX=(globalThis.DIORAMA_TEXTURE=globalThis.DIORAMA_TEXTURE||{});
+const texK=()=>TEX.patK??PAT_K;
+const rgb=(c,a=1)=>`rgba(${c[0]|0},${c[1]|0},${c[2]|0},${a})`;
+const PAPER_RGB=rgb(PAPER),NO_DASH=[];
+
+const PATTERN_CANVAS=new Map();
+function patternCanvas(ink,level,variant){
+const PK=texK(),key=ink+'|'+level+'|'+variant+'|'+PK;let cv=PATTERN_CANVAS.get(key);if(cv)return cv;
+const cell=CELLW*PK,size=Math.round(cell*PAT_CELLS),dv=TEX.dotVar??1,dj=(TEX.dotJit??1)*PK/PAT_K;
+cv=document.createElement('canvas');cv.width=size;cv.height=size;
+const c=cv.getContext('2d'),col=rgb(INK[ink]),tone=level/TONE_LEVELS;
+const R=streamOf('screen',ink,level,variant);
+c.fillStyle=col;
+if(level>=TONE_LEVELS){c.fillRect(0,0,size,size)}
+else if(tone<=.5){
+for(let y=0;y<PAT_CELLS;y++)for(let x=0;x<PAT_CELLS;x++){
+const r=cell*Math.sqrt(tone/Math.PI)*(.98+(rd(R,.86,1.1)-.98)*dv);
+c.beginPath();c.arc((x+.5)*cell+rd(R,-.4,.4)*dj,(y+.5)*cell+rd(R,-.4,.4)*dj,r,0,TAU);c.fill()}
+}else{
+c.fillRect(0,0,size,size);c.globalCompositeOperation='destination-out';
+for(let y=0;y<=PAT_CELLS;y++)for(let x=0;x<=PAT_CELLS;x++){
+const r=cell*Math.sqrt((1-tone)/Math.PI)*(.98+(rd(R,.86,1.1)-.98)*dv);
+c.beginPath();c.arc(x*cell,y*cell,r,0,TAU);c.fill()}
+c.globalCompositeOperation='source-over'}
+if(ink!=='paper'){ // ink speckle: the press is not clean
+c.globalCompositeOperation='destination-out';
+const S5=CELLW*PAT_K*PAT_CELLS,n=Math.round(S5*S5/(level>=TONE_LEVELS?120:230)*(TEX.speckle??1));
+for(let k=0;k<n;k++){const s=rd(R,.6,1.8)*(R()<.08?2.2:1)*PK/PAT_K;c.globalAlpha=rd(R,.25,.9);c.fillRect(R()*size,R()*size,s,s)}
+c.globalAlpha=1;c.globalCompositeOperation='source-over'}
+PATTERN_CANVAS.set(key,cv);return cv}
+
+let MARKS=0;
+const PATTERNS=new WeakMap();
+function inkPattern(ctx,ink,tone,variant,dx=0,dy=0){
+let bank=PATTERNS.get(ctx);if(!bank){bank=new Map();PATTERNS.set(ctx,bank)}
+const level=clamp(Math.round(tone*TONE_LEVELS),1,TONE_LEVELS),key=ink+'|'+level+'|'+variant+'|'+texK()+'|'+(TEX.cell??1)+'|'+(TEX.angleSpread??1);
+let p=bank.get(key);
+if(!p){p=ctx.createPattern(patternCanvas(ink,level,variant),'repeat');
+if(p.setTransform)p.setTransform(new DOMMatrix().translateSelf(dx,dy).rotateSelf(45+((SCREEN[ink]||0)-45)*(TEX.angleSpread??1)).scaleSelf((TEX.cell??1)/texK()));
+bank.set(key,p)}
+return p}
+
+/* ==========================================================================
+   Part 2: H — the hand. Every mark goes through here.
+   H never knows what it is drawing, only which plate and how dark.
+   ========================================================================== */
+function mkHand(o={}){
+const H={};
+let cx=o.ctx||null;
+const ox=o.ox||0,oy=o.oy||0;
+const boil=o.boil||0,variant=((boil%3)+3)%3;
+H.ox=ox;H.oy=oy;H.boil=boil;H.variant=variant;
+const RB=streamOf(boil,'boil');H.RB=RB;
+
+/* every plate sits slightly off-register, re-jittered per boil frame */
+const jit={};
+for(const k of INK_NAMES){const J=streamOf('plate',k,variant);jit[k]=[PLATE[k][0]+rd(J,-.3,.3),PLATE[k][1]+rd(J,-.3,.3)]}
+H.plate=k=>jit[k]||[0,0];
+H.bind=c=>{cx=c};H.ctx=()=>cx;
+
+const path=(c,P,dx=0,dy=0)=>{c.beginPath();for(let i=0;i<P.length;i++){i?c.lineTo(P[i][0]+dx,P[i][1]+dy):c.moveTo(P[i][0]+dx,P[i][1]+dy)}c.closePath()};
+
+/* world -> page. the only place iso maths is used. */
+H.p=(i,j,z)=>[isoX(i,j)+ox,isoY(i,j,z)+oy];
+H.iso=H.p;
+H.tile =(i,j,w,d,z)=>[H.p(i,j,z),H.p(i+w,j,z),H.p(i+w,j+d,z),H.p(i,j+d,z)];
+H.faceI=(i,j,len,z0,z1)=>[H.p(i,j,z0),H.p(i+len,j,z0),H.p(i+len,j,z1),H.p(i,j,z1)];
+H.faceJ=(i,j,len,z0,z1)=>[H.p(i,j,z0),H.p(i,j+len,z0),H.p(i,j+len,z1),H.p(i,j,z1)];
+H.path=pts=>pts.map(p=>H.p(p[0],p[1],p[2]||0));
+
+const printInk=(c,ink,tone,draw)=>{
+MARKS++;
+const k=typeof ink==='string'&&INK[ink]?ink:'blue';
+const j=jit[k];
+if(k!=='paper')c.globalCompositeOperation='multiply';
+draw(inkPattern(c,k,tone,variant,j[0],j[1]),j[0],j[1]);
+if(k!=='paper')c.globalCompositeOperation='source-over'};
+
+/* knock = print paper-white first, so ink underneath does not show through.
+   tint  = lay one plate over whatever is there (multiply).
+   fill  = knock then tint. this is literally how a screenprint works. */
+H.knock=(P,a=1)=>{if(P.length<3)return;MARKS++;path(cx,P);cx.fillStyle=a===1?PAPER_RGB:rgb(PAPER,a);cx.fill()};
+H.tint=(P,ink,tone=1)=>{if(P.length<3||tone<=0)return;printInk(cx,ink,tone,(st,dx,dy)=>{path(cx,P,dx,dy);cx.fillStyle=st;cx.fill()})};
+H.fill=(P,ink,tone=1,o2={})=>{if(P.length<3)return;if(o2.knock!==false)H.knock(P);if(tone>0)H.tint(P,ink,tone)};
+H.fill2=(P,ink,tone,ink2,tone2)=>{H.fill(P,ink,tone);H.tint(P,ink2,tone2)};
+H.erase=P=>{cx.globalCompositeOperation='destination-out';path(cx,P);cx.fillStyle='#000';cx.fill();cx.globalCompositeOperation='source-over'};
+
+/* banded gradient. real gradients look digital; bands look printed. */
+H.grad=(P,ink,t0,t1,a,b,n=10)=>{
+if(P.length<3)return;
+const dx=b[0]-a[0],dy=b[1]-a[1],L=Math.hypot(dx,dy)||1,ux=dx/L,uy=dy/L,nx=-uy,ny=ux,W=4000;
+cx.save();path(cx,P);cx.clip();
+for(let k=0;k<n;k++){
+const s0=k/n*L-(k?0:W),s1=(k+1)/n*L+(k===n-1?W:0),t=lerp(t0,t1,(k+.5)/n);
+if(t<=.02)continue;
+const B=[[a[0]+ux*s0+nx*W,a[1]+uy*s0+ny*W],[a[0]+ux*s1+nx*W,a[1]+uy*s1+ny*W],[a[0]+ux*s1-nx*W,a[1]+uy*s1-ny*W],[a[0]+ux*s0-nx*W,a[1]+uy*s0-ny*W]];
+printInk(cx,ink,t,(st,jx,jy)=>{path(cx,B,jx,jy);cx.fillStyle=st;cx.fill()})}
+cx.restore()};
+
+const rings=(c,ink,x,y,rx,ry,n,toneAt)=>{
+for(let k=0;k<n;k++){const f0=k/n,f1=(k+1)/n,t=clamp(toneAt(f0,f1),0,1);if(t<=.03)continue;
+printInk(c,ink,t,(st,dx,dy)=>{const X=x+dx,Y=y+dy;c.beginPath();c.ellipse(X,Y,rx*f1,ry*f1,0,0,TAU);
+if(k){c.moveTo(X+rx*f0,Y);c.ellipse(X,Y,rx*f0,ry*f0,0,0,TAU,true)}c.fillStyle=st;c.fill('evenodd')})}};
+/* glow = coloured halo (sun). light = paper punched back through, i.e. brightness. */
+H.glow=(x,y,rx,ry,ink='sun',tone=.6,n=7)=>{if(tone<=.02||rx<=0)return;rings(cx,ink,x,y,rx,ry,n,(f0,f1)=>tone*Math.pow(1-(f0+f1)/2,1.3))};
+H.light=(x,y,rx,ry,strength=1,n=7)=>{if(strength<=.02||rx<=0)return;rings(cx,'paper',x,y,rx,ry,n,(f0,f1)=>strength*(1.35-(f0+f1)/2*1.35))};
+
+/* wobble: no straight line is ever straight. this is what sells "drawn". */
+H.wob=(rs,amp)=>{
+const n=rs.length,q=new Array(n);
+const P1=rd(RB,0,7),P2=rd(RB,0,7),F1=rd(RB,1.4,3),F2=rd(RB,5,9);
+for(let i=0;i<n;i++){const t=n>1?i/(n-1):0;const A=rs[i>0?i-1:0],B=rs[i<n-1?i+1:n-1];
+let nx=-(B[1]-A[1]),ny=B[0]-A[0];const d=Math.hypot(nx,ny)||1;nx/=d;ny/=d;
+const off=amp*(.65*Math.sin(t*F1*2+P1)+.35*Math.sin(t*F2+P2));
+q[i]=[rs[i][0]+nx*off+rd(RB,-.12,.12),rs[i][1]+ny*off+rd(RB,-.12,.12)]}
+return q};
+
+H.line=(R,pts,ink='blue',w=1.4,o2={})=>{
+if(!pts||pts.length<2)return;
+const src=o2.closed?pts.concat([pts[0]]):pts;
+const rs=resample(src,Math.max(2.5,w*1.4));if(rs.length<2)return;
+const amp=o2.amp??Math.min(.8,w*.18+.2);
+const q=amp>0?H.wob(rs,amp):rs;
+const tone=o2.tone??1,taper=o2.taper;
+if(taper){
+const P=ribbon(q,t=>{let e=taper==='out'?.2+.8*(1-t):taper==='in'?.2+.8*t:.25+.75*Math.min(1,Math.min(t,1-t)/.25);return Math.max(.3,w*e)});
+printInk(cx,ink,tone,(st,dx,dy)=>{path(cx,P,dx,dy);cx.fillStyle=st;cx.fill()});return}
+const dash=o2.dash;
+printInk(cx,ink,tone,(st,dx,dy)=>{
+cx.strokeStyle=st;cx.lineWidth=w;cx.lineCap=o2.cap||'round';cx.lineJoin='round';if(dash)cx.setLineDash(dash);
+cx.beginPath();cx.moveTo(q[0][0]+dx,q[0][1]+dy);for(let i=1;i<q.length;i++)cx.lineTo(q[i][0]+dx,q[i][1]+dy);
+cx.stroke();if(dash)cx.setLineDash(NO_DASH)})};
+H.outline=(R,P,ink='blue',w=1.3,o2={})=>H.line(R,P,ink,w,{...o2,closed:true});
+H.dot=(x,y,r,ink='blue',tone=1,o2={})=>{const P=circ(x,y,r,Math.max(8,Math.round(r*2)));o2.knock?H.fill(P,ink,tone):H.tint(P,ink,tone)};
+H.hatch=(R,P,ink,sp,ang,w=.9,o2={})=>{
+const [x0,y0,x1,y1]=bbox(P),cxm=(x0+x1)/2,cym=(y0+y1)/2,D=Math.hypot(x1-x0,y1-y0)/2+4;
+const dx=Math.cos(ang),dy=Math.sin(ang),nx=-dy,ny=dx;
+H.clip(P,()=>{for(let s=-D;s<=D;s+=sp){if(o2.skip&&R()<o2.skip)continue;const px=cxm+nx*s,py=cym+ny*s;
+H.line(R,[[px-dx*D,py-dy*D],[px+dx*D,py+dy*D]],ink,w,{amp:o2.amp??.3,tone:o2.tone})}})};
+H.speckle=(R,P,ink,n,r0=.6,r1=1.4,tone=1)=>{
+const [x0,y0,x1,y1]=bbox(P),dots=[];
+for(let k=0;k<n;k++){const x=rd(R,x0,x1),y=rd(R,y0,y1);if(pip(P,x,y))dots.push([x,y,rd(R,r0,r1)])}
+printInk(cx,ink,tone,(st,dx,dy)=>{cx.fillStyle=st;cx.beginPath();
+for(const d of dots){cx.moveTo(d[0]+d[2]+dx,d[1]+dy);cx.arc(d[0]+dx,d[1]+dy,d[2],0,TAU)}cx.fill()})};
+H.clip=(P,fn)=>{cx.save();path(cx,P);cx.clip();try{return fn()}finally{cx.restore()}};
+H.opacity=(a,fn)=>{a=clamp(a,0,1);if(a<=0)return;if(a>=1)return fn();cx.save();cx.globalAlpha*=a;try{return fn()}finally{cx.restore()}};
+
+/* H.at defers a piece of drawing until depth-sort time.
+   key = i + j + z/1000 is the whole painter's algorithm. */
+H.pieces=[];
+H.at=(i,j,z,fn)=>{H.pieces.push({key:i+j+(z||0)*.001,fn})};
+return H}
+
+/* ==========================================================================
+   Part 3: the kit. Shared furniture so a new room is mostly assembly.
+   ========================================================================== */
+function shadowAt(H,x,y,rx,ry,tone=.22){H.tint(ell(x,y,rx,ry),'blue',tone)}
+function shadowBox(H,i,j,w,d,z,h,tone=.2){const k=Math.min(h,2)*.45;
+H.tint([H.p(i+k,j+k*.5,z),H.p(i+w+k,j+k*.5,z),H.p(i+w+k,j+d+k*.5,z),H.p(i+k,j+d+k*.5,z)].map(p=>[p[0]+5,p[1]+3]),'blue',tone)}
+
+/* the floor plate, with its cut edge showing thickness */
+function slab(H,R,rm,o={}){
+const w=rm.w,d=rm.d,th=o.th??.4;
+const top=H.tile(0,0,w,d,0),se=H.faceJ(w,0,d,-th,0),sw=H.faceI(0,d,w,-th,0);
+H.fill(se,o.edgeInk||'blue',o.edgeTone??.62);
+H.fill(sw,o.edgeInk||'blue',(o.edgeTone??.62)*.62);
+H.fill(top,o.ink||'sun',o.tone??0);
+if(o.ink2)H.tint(top,o.ink2,o.tone2??.1);
+H.outline(R,top,'blue',1,{tone:.85,amp:.3});
+H.line(R,[se[0],se[1],se[2]],'blue',1,{tone:.85,amp:.25});
+H.line(R,[sw[0],sw[3],sw[2]],'blue',1,{tone:.85,amp:.25});
+return top}
+
+const wallPt=(H,side,pos,z,off=0)=>side==='ne'?H.p(pos,-off,z):H.p(-off,pos,z);
+const wallRect=(H,side,p0,p1,z0,z1,off=.02)=>[wallPt(H,side,p0,z0,off),wallPt(H,side,p1,z0,off),wallPt(H,side,p1,z1,off),wallPt(H,side,p0,z1,off)];
+
+/* the two walls you can see. nw is the left one, ne the right one. */
+function backWalls(H,R,rm,h,o={}){
+const w=rm.w,d=rm.d,ink=o.ink||'coral',tone=o.tone??.25,style=o.style||'plain';
+const faces=[];
+if(!o.noNW)faces.push(['nw',H.faceJ(0,0,d,0,h),d,o.shadeNW??.17]);
+if(!o.noNE)faces.push(['ne',H.faceI(0,0,w,0,h),w,o.shadeNE??.06]);
+for(const [side,F,len,shade] of faces){
+H.fill(F,ink,tone);if(o.ink2)H.tint(F,o.ink2,o.tone2??.15);
+H.clip(F,()=>{
+if(style==='plank')for(let p=.7;p<len;p+=.7)H.line(R,[wallPt(H,side,p,0),wallPt(H,side,p,h)],'blue',.8,{tone:.5,amp:.2});
+if(style==='stripe')for(let p=0;p<len;p+=1)H.tint(wallRect(H,side,p,p+.5,0,h,0),o.stripeInk||ink,o.stripeTone??.25);
+if(style==='tile'){for(let p=0;p<=len;p+=.5)H.line(R,[wallPt(H,side,p,0),wallPt(H,side,p,h)],'blue',.6,{tone:.35,amp:.1});
+for(let z=0;z<=h;z+=.5)H.line(R,[wallPt(H,side,0,z),wallPt(H,side,len,z)],'blue',.6,{tone:.35,amp:.1})}
+if(style==='panel'){const zc=h*.32;H.line(R,[wallPt(H,side,0,zc),wallPt(H,side,len,zc)],'blue',1.1,{tone:.55,amp:.15});
+H.tint(wallRect(H,side,0,len,0,zc,0),'blue',.06)}
+if(style==='dots')for(let p=.35;p<len;p+=.7)for(let z=.35;z<h;z+=.7){const [x,y]=wallPt(H,side,p+((z*1.43)%1>.5?.35:0),z);H.dot(x,y,1.8,o.dotInk||'coral',.8)}
+H.tint(F,'blue',shade);
+H.grad(F,'blue',.18,0,wallPt(H,side,len/2,0),wallPt(H,side,len/2,h*.45),5)})}
+/* the floor darkens where it meets a wall — cheap ambient occlusion */
+if(!o.noNW)H.grad([H.p(0,0,0),H.p(1.4,1.4,0),H.p(1.4,d,0),H.p(0,d,0)],'blue',.24,0,H.p(0,d/2,0),H.p(1.2,d/2,0),5);
+if(!o.noNE)H.grad([H.p(0,0,0),H.p(w,0,0),H.p(w,1.1,0),H.p(1.1,1.1,0)],'blue',.18,0,H.p(w/2,0,0),H.p(w/2,1,0),5);
+const th=o.th??.14;
+if(!o.noNW){const T=[H.p(0,0,h),H.p(0,d,h),H.p(-th,d,h),H.p(-th,0,h)];H.fill(T,ink,tone*.4);H.outline(R,T,'blue',1,{tone:.9,amp:.2})}
+if(!o.noNE){const T=[H.p(0,0,h),H.p(w,0,h),H.p(w,-th,h),H.p(0,-th,h)];H.fill(T,ink,tone*.4);H.outline(R,T,'blue',1,{tone:.9,amp:.2})}
+for(const [,F] of faces)H.outline(R,F,'blue',1.1,{tone:.9,amp:.25})}
+
+/* the workhorse. three faces, two tones, one outline. most furniture is this. */
+function boxAt(H,R,i,j,w,d,z,h,col,o={}){
+const [ink,tone]=Array.isArray(col)?col:[col.ink,col.tone];
+if(o.shadow!==false&&h>.05)shadowBox(H,i,j,w,d,z,h,o.shadowTone??.2);
+const top=H.tile(i,j,w,d,z+h),se=H.faceJ(i+w,j,d,z,z+h),sw=H.faceI(i,j+d,w,z,z+h);
+H.fill(sw,ink,tone);H.tint(sw,'blue',o.half??.2);
+H.fill(se,ink,tone);H.tint(se,'blue',o.full??.42);
+H.fill(top,o.topInk||ink,o.topTone??tone);
+if(o.line!==false){const lw=o.lw??1.1;
+H.outline(R,top,'blue',lw,{tone:.9,amp:.2});
+H.line(R,[top[3],sw[0],sw[1],se[1],top[2]],'blue',lw,{tone:.9,amp:.2});
+H.line(R,[top[2],sw[1]],'blue',lw,{tone:.9,amp:.2})}
+return {top,se,sw}}
+
+function rug(H,R,i,j,w,d,ink,tone,o={}){
+const P=H.tile(i,j,w,d,o.z||.01);H.fill(P,ink,tone);
+if(o.border)H.outline(R,sc(P,...centroid(P),.86),o.border,1.2,{tone:.8});
+if(o.line!==false)H.outline(R,P,'blue',.9,{tone:.7});return P}
+
+function windowOn(H,R,side,pos,z,w,h,o={}){
+const P=wallRect(H,side,pos-w/2,pos+w/2,z,z+h,.03);
+H.fill(P,o.sky||'blue',o.skyTone??.15);
+if(o.sky2)H.tint(P,o.sky2,o.sky2Tone??.3);
+if(o.inside)H.clip(P,()=>o.inside(P));
+const fr=wallRect(H,side,pos-w/2-.08,pos+w/2+.08,z-.08,z+h+.08,.05);
+H.outline(R,fr,'blue',1.4,{tone:.9,amp:.2});
+H.outline(R,P,'blue',1,{tone:.8,amp:.15});
+const bars=o.bars??1;
+for(let k=1;k<=bars;k++){const p=pos-w/2+w*k/(bars+1);H.line(R,[wallPt(H,side,p,z,.05),wallPt(H,side,p,z+h,.05)],'blue',1.1,{tone:.85,amp:.1})}
+if(o.mullion!==false)H.line(R,[wallPt(H,side,pos-w/2,z+h*.5,.05),wallPt(H,side,pos+w/2,z+h*.5,.05)],'blue',1.1,{tone:.85,amp:.1});
+return P}
+
+function doorOn(H,R,side,pos,w,h,o={}){
+const P=wallRect(H,side,pos-w/2,pos+w/2,0,h,.03);
+H.fill(P,o.ink||'blue',o.tone??.5);
+if(o.dark)H.tint(P,'blue',.35);
+const fr=wallRect(H,side,pos-w/2-.1,pos+w/2+.1,0,h+.1,.06);
+H.outline(R,fr,'blue',1.4,{tone:.9,amp:.2});H.outline(R,P,'blue',1,{tone:.8});
+const [kx,ky]=wallPt(H,side,pos+w/2-.22,h*.45,.05);H.dot(kx,ky,2,'sun',.9,{knock:true});
+return P}
+
+function frameOn(H,R,side,pos,z,w,h,o={}){
+const P=wallRect(H,side,pos-w/2,pos+w/2,z,z+h,.04);
+H.fill(P,'paper',1);if(o.ink)H.tint(sc(P,...centroid(P),.78),o.ink,o.tone??.5);
+H.outline(R,P,'blue',1.1,{tone:.85,amp:.15});return P}
+
+function shelfOn(H,R,side,p0,p1,z,o={}){
+const dep=o.dep??.32,th=.08;
+const A=wallPt(H,side,p0,z,0),B=wallPt(H,side,p1,z,0);
+const A2=side==='ne'?H.p(p0,-dep,z):H.p(-dep,p0,z),B2=side==='ne'?H.p(p1,-dep,z):H.p(-dep,p1,z);
+const top=[A,B,B2,A2];H.fill(top,o.ink||'coral',o.tone??.5);
+const front=[A,B,[B[0],B[1]+th*TZ],[A[0],A[1]+th*TZ]];H.fill(front,o.ink||'coral',(o.tone??.5)*1.3);
+H.outline(R,top,'blue',1,{tone:.85,amp:.15});H.outline(R,front,'blue',1,{tone:.85,amp:.15});
+return top}
+
+function plant(H,R,x,y,s=1,o={}){
+const pot=[[x-7*s,y-9*s],[x+7*s,y-9*s],[x+5*s,y],[x-5*s,y]];
+H.fill(pot,o.pot||'coral',o.potTone??.7);H.tint([[x,y-9*s],[x+7*s,y-9*s],[x+5*s,y],[x,y]],'blue',.25);
+H.outline(R,pot,'blue',1,{amp:.2});
+const n=o.n??7;
+for(let k=0;k<n;k++){const a=-Math.PI/2+rd(R,-1.15,1.15),L=rd(R,11,22)*s;
+const tip=[x+Math.cos(a)*L,y-9*s+Math.sin(a)*L];
+const mid=[lerp(x,tip[0],.5)+rd(R,-3,3)*s,lerp(y-9*s,tip[1],.5)+rd(R,-2,2)*s];
+const leaf=loop([[x,y-9*s],[mid[0]-2.5*s,mid[1]],tip,[mid[0]+2.5*s,mid[1]]],2);
+H.fill(leaf,'teal',rd(R,.55,.85));H.outline(R,leaf,'blue',.8,{tone:.8,amp:.2})}}
+
+function lamp(H,R,x,y,s=1,o={}){
+const shade=[[x-9*s,y],[x+9*s,y],[x+5.5*s,y-11*s],[x-5.5*s,y-11*s]];
+H.fill(shade,o.ink||'sun',o.tone??.85);H.tint([[x,y],[x+9*s,y],[x+5.5*s,y-11*s],[x,y-11*s]],'blue',.18);
+H.outline(R,shade,'blue',1.1,{amp:.2});
+if(o.on)H.glow(x,y+3*s,16*s,9*s,'sun',.5)}
+
+function cloud(H,R,x,y,s=12){
+const P=[];const n=9;
+for(let k=0;k<n;k++){const a=k/n*TAU;const r=s*(.55+.45*Math.abs(Math.sin(a*2.3+1)));
+P.push([x+Math.cos(a)*r*1.7,y+Math.sin(a)*r*.62])}
+const Q=loop(P,2);H.fill(Q,'paper',1);H.tint(Q,'paper',1);H.outline(R,Q,'blue',1,{tone:.45,amp:.35})}
+
+/* ==========================================================================
+   Part 3b: the density kit.
+
+   Richness is a count, not a craft. Hand-placing props does not scale — these
+   do. Every one of them produces six to thirty objects from one call. Reach
+   for these before you type a second boxAt.
+   ========================================================================== */
+
+/* a wobbly closed blob — stains, puddles, piles, scuffs */
+function blobAt(R,x,y,rx,ry,n=9){
+const P=[];for(let k=0;k<n;k++){const a=k/n*TAU,d=rd(R,.7,1.25);
+P.push([x+Math.cos(a)*rx*d,y+Math.sin(a)*ry*d])}
+return loop(P,2)}
+
+/* scatter n items inside a polygon — a tabletop, a rug, a patch of floor.
+   fn(x,y,k,R) draws one. Items keep clear of the edges. */
+function scatterOn(H,R,P,n,fn,inset=.82){
+const [x0,y0,x1,y1]=bbox(P),c=centroid(P),Q=sc(P,c[0],c[1],inset);
+let placed=0,guard=0;
+while(placed<n&&guard++<n*40){
+const x=rd(R,x0,x1),y=rd(R,y0,y1);
+if(!pip(Q,x,y))continue;
+fn(x,y,placed,R);placed++}
+return placed}
+
+/* a stack of thin things — paper, plates, trays, folded cloth — with drift */
+function stackOf(H,R,i,j,w,d,z,n,fn,step=.014){
+for(let k=0;k<n;k++)fn(H.tile(i+rd(R,-.014,.014),j+rd(R,-.012,.012),w,d,z+k*step),k,R)}
+
+/* a run of book spines, box files, bottles. One call is a whole shelf,
+   including the gaps where somebody took one out. */
+function booksAlong(H,R,axis,i,j,len,z,dep,o={}){
+const inks=o.inks||['teal','coral','blue','sun'];
+let p=0,n=0;
+while(p<len-.05){
+const bw=rd(R,o.w0??.09,o.w1??.17),bh=rd(R,o.h0??.20,o.h1??.38);
+if(p+bw>len)break;
+if(ch(R,o.gap??.09)){p+=bw;continue}
+const [bi,bj]=axis==='i'?[i+p,j]:[i,j+p];
+const [bw2,bd2]=axis==='i'?[bw,dep]:[dep,bw];
+boxAt(H,R,bi,bj,bw2,bd2,z,bh,[pk(R,inks),rd(R,.45,.9)],{lw:.6,shadow:false});
+p+=bw;n++}
+return n}
+
+/* paper pinned to a wall: notices, a rota, photos, someone's kid's drawing */
+function notesOn(H,R,side,p0,p1,z0,z1,n,o={}){
+const inks=o.inks||['paper','coral','teal','sun'],off=o.off??.05;
+for(let k=0;k<n;k++){
+const w=rd(R,o.w0??.13,o.w1??.22),h=w*rd(R,.7,1.25);
+const p=rd(R,p0,Math.max(p0,p1-w)),z=rd(R,z0,Math.max(z0,z1-h));
+const N=wallRect(H,side,p,p+w,z,z+h,off);
+H.fill(N,pk(R,inks),rd(R,.5,1));
+H.outline(R,N,'blue',.6,{tone:.6,amp:.25});
+if(ch(R,.5))for(let l=1;l<3;l++)
+H.line(R,[lerpP(N[0],N[3],l/3),lerpP(N[1],N[2],l/3)],'blue',.45,{tone:.3,amp:.06});
+const [px,py]=wallPt(H,side,p+w/2,z+h*.94,off+.01);
+H.dot(px,py,.85,pk(R,['coral','teal','sun']),.95)}}
+
+/* a cord that droops between two page-space points */
+function cableBetween(H,R,a,b,sag=14,o={}){
+const pts=[],n=o.n??10;
+for(let k=0;k<=n;k++){const u=k/n;
+pts.push([lerp(a[0],b[0],u),lerp(a[1],b[1],u)+Math.sin(u*Math.PI)*sag])}
+H.line(R,curve(pts,2),o.ink||'blue',o.w??1.1,{tone:o.tone??.75,amp:.25})}
+
+/* open shelving. fn(z,row,R) fills each shelf — usually with booksAlong. */
+function shelvingAt(H,R,i,j,w,d,h,rows,fn,o={}){
+const ink=o.ink||'blue',tone=o.tone??.7;
+shadowBox(H,i,j,w,d,0,h,.2);
+for(const [a,b] of[[i,j],[i+w-.1,j],[i,j+d-.1],[i+w-.1,j+d-.1]])
+boxAt(H,R,a,b,.1,.1,0,h,[ink,tone],{shadow:false,lw:.7});
+for(let r=0;r<rows;r++){const z=h*(r+.12)/rows;
+boxAt(H,R,i,j,w,d,z,.05,[o.shelfInk||'paper',1],{topInk:o.topInk||'sun',topTone:.22,shadow:false,lw:.7});
+if(fn)fn(z+.05,r,R)}}
+
+/* a pipe or conduit running along a wall, with collars */
+function pipeRun(H,R,side,p0,p1,z,o={}){
+const off=o.off??.10,w=o.w??3.2;
+const a=wallPt(H,side,p0,z,off),b=wallPt(H,side,p1,z,off);
+H.line(R,[a,b],o.ink||'blue',w,{tone:o.tone??.55,amp:.08});
+H.line(R,[a,b],'paper',w*.28,{tone:.3,amp:.08});
+for(let p=p0+.5;p<p1;p+=rd(R,1.3,2.6)){
+const c=wallPt(H,side,p,z,off+.02);H.fill(circ(c[0],c[1],w*.62),'blue',.85)}}
+
+/* --- the small props you will otherwise rewrite in every room --- */
+function mugAt(H,R,x,y,ink='coral',tone=.6,s=1){
+const M=rect(x-4*s,y-8*s,x+4*s,y);
+H.fill(M,'paper',1);if(ink!=='paper')H.tint(M,ink,tone);
+H.outline(R,M,'blue',.8);
+H.fill(ell(x,y-8*s,4*s,1.5*s),'blue',.55);
+H.line(R,arcPts(x+4*s,y-4.5*s,3*s,2.6*s,-1.5,1.5,6),'blue',.8)}
+
+function bottleAt(H,R,x,y,s=1,ink='teal',tone=.5){
+const b=[[x-4*s,y],[x+4*s,y],[x+3.6*s,y-11*s],[x+1.4*s,y-15*s],
+         [x+1.4*s,y-20*s],[x-1.4*s,y-20*s],[x-1.4*s,y-15*s],[x-3.6*s,y-11*s]];
+H.fill(b,ink,tone);
+H.tint([[x,y],[x+4*s,y],[x+3.6*s,y-11*s],[x+1.4*s,y-15*s],[x,y-15*s]],'blue',.2);
+H.outline(R,b,'blue',.9,{amp:.2});
+H.fill(rect(x-1.5*s,y-22*s,x+1.5*s,y-19.5*s),'coral',.8)}
+
+function paperAt(H,R,i,j,w,d,z,o={}){
+const P=H.tile(i,j,w,d,z);
+H.fill(P,'paper',1);if(o.ink)H.tint(P,o.ink,o.tone??.3);
+H.outline(R,P,'blue',.6,{tone:.75,amp:.12});
+const n=o.lines??3;
+for(let k=1;k<=n;k++)H.line(R,[lerpP(P[0],P[3],k/(n+1)),lerpP(P[1],P[2],k/(n+1))],'blue',.5,{tone:.35,amp:.06});
+return P}
+
+/* wear. Rooms read as inhabited almost entirely because of these. */
+function scuffOn(H,R,P,n=6,o={}){
+const [x0,y0,x1,y1]=bbox(P);
+H.clip(P,()=>{for(let k=0;k<n;k++){
+const x=rd(R,x0,x1),y=rd(R,y0,y1);
+if(!pip(P,x,y))continue;
+const r=rd(R,o.r0??5,o.r1??16);
+H.tint(blobAt(R,x,y,r,r*.5),o.ink||'blue',rd(R,.04,o.tone??.11))}})}
+
+/* ==========================================================================
+   Part 4: FIGURES. One rig, fifteen joints, a library of looping clips.
+   A pose is 15 numbers. A clip is a list of [time, pose] keys.
+   ========================================================================== */
+const FIGURES=(()=>{
+const rest={x:0,y:0,drop:0,lean:0,head:0,al:-10,ar:12,el:-6,er:6,ll:-5,lr:5,kl:0,kr:0,roll:0};
+const clips=Object.create(null);
+const clip=(name,dur,keys)=>{clips[name]={dur,keys:keys.map(([t,p])=>[t,{...rest,...p}])}};
+const seat={drop:.47,ll:84,lr:80,kl:-84,kr:-80};
+
+clip('idle',3,[[0,{}],[.5,{y:-.5,head:3,ar:9}],[1,{}]]);
+clip('walk',1,[[0,{ll:-26,lr:22,kr:14,al:24,ar:-24}],[.25,{y:-1,ll:0,lr:0,kl:22,al:0,ar:0}],[.5,{ll:22,lr:-26,kl:14,al:-24,ar:24}],[.75,{y:-1,ll:0,lr:0,kr:22,al:0,ar:0}],[1,{ll:-26,lr:22,kr:14,al:24,ar:-24}]]);
+clip('sit',3,[[0,{...seat,al:20,ar:28,el:30,er:30}],[.5,{...seat,y:-.4,head:4,al:20,ar:30,el:30,er:32}],[1,{...seat,al:20,ar:28,el:30,er:30}]]);
+clip('type',.5,[[0,{...seat,lean:-8,head:10,al:62,ar:66,el:38,er:30}],[.5,{...seat,lean:-8,head:10,al:66,ar:61,el:30,er:40}],[1,{...seat,lean:-8,head:10,al:62,ar:66,el:38,er:30}]]);
+clip('read',4,[[0,{...seat,head:14,al:52,ar:56,el:78,er:74}],[.5,{...seat,head:18,al:54,ar:58,el:78,er:74,y:-.3}],[1,{...seat,head:14,al:52,ar:56,el:78,er:74}]]);
+clip('write',1.2,[[0,{...seat,lean:-10,head:16,al:40,ar:70,el:40,er:20}],[.5,{...seat,lean:-10,head:16,al:40,ar:74,el:40,er:12}],[1,{...seat,lean:-10,head:16,al:40,ar:70,el:40,er:20}]]);
+clip('wave',1.2,[[0,{ar:145,er:20,head:-4}],[.25,{ar:158,er:-25}],[.5,{ar:145,er:20,head:-4}],[.75,{ar:158,er:-25}],[1,{ar:145,er:20,head:-4}]]);
+clip('point',2,[[0,{ar:112,er:8,head:-12,lean:-3}],[.5,{ar:116,er:4,head:-14,lean:-4}],[1,{ar:112,er:8,head:-12,lean:-3}]]);
+clip('lookup',4,[[0,{head:-26,lean:5,al:-8,ar:8}],[.5,{head:-30,lean:6,y:-.4}],[1,{head:-26,lean:5,al:-8,ar:8}]]);
+clip('hold',3,[[0,{al:55,ar:58,el:55,er:55}],[.5,{al:57,ar:60,el:55,er:55,y:-.4}],[1,{al:55,ar:58,el:55,er:55}]]);
+clip('carry',1,[[0,{al:60,ar:60,el:60,er:60,ll:-20,lr:18}],[.5,{al:60,ar:60,el:60,er:60,ll:18,lr:-20,y:-1}],[1,{al:60,ar:60,el:60,er:60,ll:-20,lr:18}]]);
+clip('talk',2.4,[[0,{ar:60,er:30,head:5}],[.5,{ar:35,er:55,al:-30,head:-3}],[1,{ar:60,er:30,head:5}]]);
+clip('think',4,[[0,{ar:22,er:150,al:30,el:80,head:10}],[.5,{ar:24,er:152,al:30,el:80,head:-6}],[1,{ar:22,er:150,al:30,el:80,head:10}]]);
+clip('drink',4,[[0,{...seat,ar:30,er:95,head:6}],[.4,{...seat,ar:30,er:95,head:6}],[.55,{...seat,ar:55,er:120,head:-6}],[.75,{...seat,ar:55,er:120,head:-6}],[1,{...seat,ar:30,er:95,head:6}]]);
+clip('stretch',3,[[0,{al:-170,ar:170,y:-1}],[.5,{al:-176,ar:176,y:-2,lean:4}],[1,{al:-170,ar:170,y:-1}]]);
+clip('reach',2.5,[[0,{ar:150,er:0,al:30,head:-18,y:-2,lean:4}],[.5,{ar:160,er:0,al:30,head:-20,y:-3,lean:5}],[1,{ar:150,er:0,al:30,head:-18,y:-2,lean:4}]]);
+clip('kneel',3,[[0,{drop:.34,ll:78,kl:-150,lr:-12,kr:100,lean:-8,al:40,ar:60,el:40,er:40}],[.5,{drop:.34,ll:78,kl:-150,lr:-12,kr:100,lean:-10,al:42,ar:64,el:40,er:40,head:6}],[1,{drop:.34,ll:78,kl:-150,lr:-12,kr:100,lean:-8,al:40,ar:60,el:40,er:40}]]);
+clip('wait',5,[[0,{lean:-2,al:24,ar:-18,el:38,er:20,head:4,ll:-4,lr:6}],[.28,{lean:-3,al:26,ar:-16,el:40,er:22,head:-6,ll:-3,lr:7,y:-.3}],[.55,{lean:2,al:20,ar:-20,el:34,er:18,head:8,ll:6,lr:-4}],[.8,{lean:1,al:22,ar:-18,el:36,er:20,head:-2,ll:5,lr:-3,y:-.3}],[1,{lean:-2,al:24,ar:-18,el:38,er:20,head:4,ll:-4,lr:6}]]);
+clip('pack',2.2,[[0,{lean:-14,head:14,al:48,ar:58,el:58,er:52}],[.5,{lean:-18,head:18,al:52,ar:66,el:64,er:44,y:-.4}],[1,{lean:-14,head:14,al:48,ar:58,el:58,er:52}]]);
+
+const vec=(deg,len)=>[Math.sin(deg*Math.PI/180)*len,Math.cos(deg*Math.PI/180)*len];
+const add=(a,b)=>[a[0]+b[0],a[1]+b[1]];
+const rotate=(p,deg)=>{const a=deg*Math.PI/180;return[p[0]*Math.cos(a)-p[1]*Math.sin(a),p[0]*Math.sin(a)+p[1]*Math.cos(a)]};
+
+function sample(name,phase){
+const c=clips[name]||clips.idle,u=fract(Number.isFinite(phase)?phase:0);
+let a=c.keys[0],b=c.keys[c.keys.length-1];
+for(let k=1;k<c.keys.length;k++)if(u<=c.keys[k][0]){a=c.keys[k-1];b=c.keys[k];break}
+const v=sm(clamp((u-a[0])/((b[0]-a[0])||1),0,1)),pose={};
+for(const k in rest)pose[k]=lerp(a[1][k],b[1][k],v);
+return pose}
+function samplePose(a){
+const p=sample(a.clip,a.phase);if(!a.blend||!(a.blend.w>0))return p;
+const q=sample(a.blend.clip,a.blend.phase),w=clamp(a.blend.w,0,1);
+for(const k in rest)p[k]=lerp(p[k],q[k],w);return p}
+
+const BODIES={
+adult:{leg:19,torso:15,head:6.4,sw:5.2,arm:8.4,w:4.4,skinDefault:['coral',.3]},
+child:{leg:11.5,torso:10,head:6,sw:4.1,arm:5.8,w:3.6,skinDefault:['coral',.28]},
+elder:{leg:17,torso:14,head:6.2,sw:5,arm:8,w:4.2,skinDefault:['coral',.34],lean:7}};
+const HEIGHT={adult:40,child:27,elder:37};
+
+function skeleton(p,q){
+const b={root:[q.x,q.y+q.drop*p.leg]};
+b.hips=[b.root[0],b.root[1]-p.leg];
+b.chest=add(b.hips,vec(q.lean+180,p.torso));
+b.neck=add(b.chest,vec(q.lean+180,1.5));
+b.head=add(b.neck,vec(q.lean-q.head*.3+180,p.head*.95));
+for(const s of['l','r']){const sign=s==='l'?-1:1;
+b[s+'sh']=add(b.chest,rotate([sign*p.sw,1.5],q.lean));
+b[s+'el']=add(b[s+'sh'],vec(q['a'+s],p.arm*.52));
+b[s+'ha']=add(b[s+'el'],vec(q['a'+s]+q['e'+s],p.arm*.5));
+b[s+'hip']=add(b.hips,[sign*p.sw*.45,0]);
+b[s+'kn']=add(b[s+'hip'],vec(q['l'+s],p.leg*.52));
+b[s+'ft']=add(b[s+'kn'],vec(q['l'+s]+q['k'+s],p.leg*.5))}
+return b}
+
+/* painter maps rig-space to page-space, mirroring for the two facings */
+function painter(H,R,x,y,scale,face,roll=0){
+const mirror=face==='sw'||face==='nw'?-1:1;
+const pt=p=>{const q=rotate(p,roll*mirror);return[x+q[0]*scale*mirror,y+q[1]*scale]};
+const P=A=>A.map(pt);
+const fill=(A,col,o={})=>{const Q=P(A);H.fill(Q,col[0],col[1]);if(col[2])H.tint(Q,col[2],col[3]);
+if(o.line!==false)H.outline(R,Q,'blue',(o.w??.95)*Math.min(1.4,scale),{tone:.92,amp:.12})};
+const tube=(A,col,r)=>fill(ribbon(A,r*2),col);
+const line=(A,ink='blue',w=1,tone=.95)=>H.line(R,P(A),ink,w*scale,{tone,amp:.1});
+const oval=(cx,cy,rx,ry,col,o)=>fill(ell(cx,cy,rx,ry,18),col,o);
+const dot=(cx,cy,r,ink='blue',tone=1)=>{const q=pt([cx,cy]);H.dot(q[0],q[1],r*scale,ink,tone)};
+return {pt,P,fill,tube,line,oval,dot,mirror,back:face==='ne'||face==='nw',scale}}
+
+function drawPerson(H,R,who,args){
+const p={...BODIES[who]||BODIES.adult},o=args.opts||{};
+const q=samplePose(args);
+if(p.lean&&!['sit','type','read','write','drink'].includes(args.clip))q.lean+=p.lean;
+const b=skeleton(p,q),D=painter(H,R,args.x,args.y,args.scale||1,args.face,q.roll);
+const skin=o.skin||p.skinDefault,shirt=o.shirt||['teal',.7],pants=o.pants||['blue',.62],
+      hair=o.hair||['blue',.85],shoe=o.shoe||['blue',.9];
+const hs=o.hairStyle||'short',hr=p.head,back=D.back;
+const far=back?'r':'l',near=back?'l':'r';
+const leg=s=>{D.tube([b[s+'hip'],b[s+'kn'],b[s+'ft']],o.dress?skin:pants,p.w*.5);
+              D.oval(b[s+'ft'][0]+1.6,b[s+'ft'][1]-.8,2.6,1.6,shoe)};
+const arm=s=>{D.tube([b[s+'sh'],b[s+'el'],b[s+'ha']],o.sleeve||shirt,p.w*.42);
+              D.oval(b[s+'ha'][0],b[s+'ha'][1],1.7,1.7,skin,{w:.7})};
+
+/* contact shadow first, so everything sits on the floor */
+if(!o.noShadow){const g=args.ground||[args.x,args.y];
+H.tint(ell(g[0]+3*(args.scale||1),g[1]+1,11*(args.scale||1),3.8*(args.scale||1)),'blue',.22)}
+
+if(hs==='long'&&!back)D.fill(loop([add(b.head,[-hr-1,-2]),add(b.head,[hr+1,-2]),add(b.head,[hr+2,hr+8]),add(b.head,[-hr-2,hr+9])],1),hair);
+arm(far);leg(far);leg(near);
+const bottom=o.dress?add(b.hips,[0,p.leg*.55]):add(b.hips,[0,2.5]);
+const sk=o.dress?p.sw*1.55:p.sw*1.02;
+D.fill(loop([add(b.lsh,[-.6,-1.2]),add(b.rsh,[.6,-1.2]),add(bottom,[sk,0]),add(bottom,[-sk,0])],1),shirt);
+if(o.apron||o.vest)D.fill([add(b.chest,[-p.sw*.45,2]),add(b.chest,[p.sw*.45,2]),add(bottom,[p.sw*.55,-1]),add(bottom,[-p.sw*.55,-1])],o.apron||o.vest,{w:.7});
+if(hs==='long'&&back)D.fill(loop([add(b.head,[-hr-1,-2]),add(b.head,[hr+1,-2]),add(b.head,[hr+2,hr+9]),add(b.head,[-hr-2,hr+9])],1),hair);
+D.tube([b.neck,add(b.neck,[0,-1.5])],skin,p.w*.4);
+D.oval(b.head[0],b.head[1],hr,hr*1.06,skin,{w:.85});
+/* hair */
+if(hs==='short')D.fill(loop([add(b.head,[-hr-.6,1.5]),add(b.head,[-hr-.2,-hr*.7]),add(b.head,[0,-hr-1.3]),add(b.head,[hr+.2,-hr*.7]),add(b.head,[hr+.6,1.5]),add(b.head,[hr*.4,-hr*.2]),add(b.head,[-hr*.5,-hr*.1])],2),hair,{w:.7});
+if(hs==='cap')D.fill(loop([add(b.head,[-hr-1.4,-hr*.2]),add(b.head,[-hr*.6,-hr-1.5]),add(b.head,[hr*.8,-hr-1.2]),add(b.head,[hr+1.6,-hr*.35]),add(b.head,[hr+2.6,-hr*.1])],2),hair,{w:.7});
+if(hs==='curly'){for(let k=0;k<7;k++){const a=Math.PI+k/6*Math.PI;D.oval(b.head[0]+Math.cos(a)*hr*.95,b.head[1]+Math.sin(a)*hr*.95,hr*.46,hr*.46,hair,{w:.6})}}
+if(hs==='pony'){D.fill(loop([add(b.head,[-hr-.6,1]),add(b.head,[0,-hr-1.4]),add(b.head,[hr+.6,1]),add(b.head,[0,-hr*.3])],2),hair,{w:.7});
+D.fill(loop([add(b.head,[-hr,-1]),add(b.head,[-hr-3.5,3]),add(b.head,[-hr-2.5,8]),add(b.head,[-hr+.5,3])],2),hair,{w:.7})}
+if(hs==='bun'){D.fill(loop([add(b.head,[-hr-.6,1.2]),add(b.head,[0,-hr-1.3]),add(b.head,[hr+.6,1.2]),add(b.head,[0,-hr*.3])],2),hair,{w:.7});
+D.oval(b.head[0]-hr*.2,b.head[1]-hr-2.2,2.6,2.3,hair,{w:.7})}
+/* face: two dots and a line, never more */
+if(!back){const e=hr*.36;
+D.dot(b.head[0]-e,b.head[1]-hr*.08,.85,'blue',.95);
+D.dot(b.head[0]+e,b.head[1]-hr*.08,.85,'blue',.95);
+if(o.smile!==false)D.line([add(b.head,[-e*.55,hr*.42]),add(b.head,[0,hr*.55]),add(b.head,[e*.55,hr*.42])],'blue',.7,.8);
+if(o.glasses){D.line([add(b.head,[-e-1.5,-hr*.08]),add(b.head,[-e+1.5,-hr*.08])],'blue',.7,.9);
+D.oval(b.head[0]-e,b.head[1]-hr*.08,2,1.8,['paper',0],{w:.7});
+D.oval(b.head[0]+e,b.head[1]-hr*.08,2,1.8,['paper',0],{w:.7});
+D.line([add(b.head,[-e+2,-hr*.08]),add(b.head,[e-2,-hr*.08])],'blue',.7,.9)}}
+arm(near);
+const pts={head:D.pt(b.head),chest:D.pt(b.chest),nearHand:D.pt(b[near+'ha']),farHand:D.pt(b[far+'ha']),
+           hips:D.pt(b.hips),D,b,face:args.face};
+if(o.prop)o.prop(H,R,pts);
+return pts}
+
+const facing=(di,dj,prev='se')=>Math.hypot(di,dj)<1e-6?prev:(Math.abs(di)>=Math.abs(dj)?(di>=0?'se':'nw'):(dj>=0?'sw':'ne'));
+function pathAt(path,u){
+const v=clamp(u,0,1)*(path.length-1),k=Math.min(path.length-2,Math.floor(v)),a=path[k],b=path[k+1],f=v-k;
+return {i:lerp(a[0],b[0],f),j:lerp(a[1],b[1],f),z:lerp(a[2]||0,b[2]||0,f),face:facing(b[0]-a[0],b[1]-a[1])}}
+/* walk there, wait, walk back, wait. loops exactly. */
+function walkBack(path,speed,wait,t,clip='walk',idle='idle'){
+let L=0;for(let k=1;k<path.length;k++)L+=Math.hypot(path[k][0]-path[k-1][0],path[k][1]-path[k-1][1]);
+const go=L/Math.max(.01,speed),T=2*go+2*wait,u=fract(t/T)*T;
+const stride=clip==='run'?1.5:.8,ph=v=>v*L/stride;
+const along=(v,dv)=>{const a=pathAt(path,v),b=pathAt(path,clamp(v+dv,0,1));return {...a,face:facing(b.i-a.i,b.j-a.j,a.face)}};
+const E=Math.min(.35,go*.4),ease=v=>({blend:{clip:idle,phase:t/3,w:1-sstep(0,E,v)*sstep(0,E,go-v)}});
+if(u<go)return {...along(u/go,.01),clip,phase:ph(u/go),...ease(u)};
+if(u<go+wait)return {...pathAt(path,1),clip:idle,phase:t/3};
+if(u<2*go+wait){const v=u-go-wait;return {...along(1-v/go,-.01),clip,phase:ph(v/go),...ease(v)}}
+/* face the way the next lap sets off, not the way we came in — otherwise the
+   figure mirrors 180 degrees at the wrap, which no amount of squinting catches. */
+return {...pathAt(path,0),face:facing(path[1][0]-path[0][0],path[1][1]-path[0][1]),clip:idle,phase:t/3}}
+
+function state(fig,t){
+const at=fig.at||fig.path?.[0]||[6,6,0];
+let s={i:at[0],j:at[1],z:at[2]||0,face:fig.face||'se',clip:fig.clip||'idle',opacity:1,hidden:false,opts:fig.opts};
+if(fig.path)Object.assign(s,walkBack(fig.path,fig.speed||.8,fig.wait??1.5,t+(fig.delay||0),fig.moveClip||'walk',fig.clip||'idle'));
+if(typeof fig.move==='function'){const m=fig.move(t)||{};
+if(m.clip&&!('blend' in m))s.blend=undefined;
+for(const k in m)if(m[k]!==undefined&&k!=='opts')s[k]=m[k];
+if(m.opts)s.opts={...fig.opts,...m.opts}}
+if(s.phase===undefined||!Number.isFinite(s.phase))s.phase=t/((clips[s.clip]||clips.idle).dur);
+if(s.opacity<=0)s.hidden=true;
+return s}
+const SCALE=1.35;
+const seatZ=(who='adult',scale=SCALE)=>(BODIES[who]||BODIES.adult).leg*scale*.53/TZ;
+const heightZ=(who='adult',scale=SCALE)=>(HEIGHT[who]||40)*scale/TZ;
+const draw=(H,R,args)=>drawPerson(H,R,args.who,args);
+return {draw,state,facing,pathAt,walkBack,clips,clip,sample,samplePose,BODIES,HEIGHT,SCALE,seatZ,heightZ,rest}})();
+
+/* ==========================================================================
+   Part 5: the runtime. Bake what never moves, redraw what does.
+   under + over are baked once per (boil variant, zoom bucket).
+   live + figures are redrawn every frame.
+   ========================================================================== */
+function mount(rm,canvas){
+const stage=canvas,ctx=stage.getContext('2d',{alpha:false});
+const ERRORS=[];
+{const ce=console.error;console.error=function(...a){ERRORS.push(a.map(x=>x&&x.stack?String(x.message||x):String(x)).join(' ').slice(0,180));ce.apply(console,a)};
+addEventListener('error',e=>ERRORS.push('window: '+e.message));}
+/* ?t=8.6 freezes the clock on one beat. ?zoom= and ?focus=i,j aim the camera.
+   You will use these constantly while tuning a loop. */
+const qs=new URLSearchParams(location.search);
+const frozenT=qs.has('t')?parseFloat(qs.get('t')):null;
+let dpr=1,W=0,Hh=0;
+const WALL=rm.wall??3.2;
+/* page bounds of the room, in local coordinates */
+const B={x0:-rm.d*TW/2-60,y0:-WALL*TZ-90,x1:rm.w*TW/2+60,y1:(rm.w+rm.d)*TH/2+90};
+const RW=B.x1-B.x0,RH=B.y1-B.y0;
+const cam={x:(B.x0+B.x1)/2,y:(B.y0+B.y1)/2,zoom:1};
+const MINZ=.25,MAXZ=6,BUCKETS=[.75,1.5,3,5];
+const bucketFor=z=>BUCKETS.find(b=>b>=z-1e-6)||BUCKETS[BUCKETS.length-1];
+
+/* ---- the paper the room is printed on ---- */
+let sheet=null;
+function buildSheet(){
+const k=.3,pad=340,b={x0:B.x0-pad,y0:B.y0-pad*.8,x1:B.x1+pad,y1:B.y1+pad};
+const cv=document.createElement('canvas');
+cv.width=Math.ceil((b.x1-b.x0)*k);cv.height=Math.ceil((b.y1-b.y0)*k);
+const c=cv.getContext('2d');c.fillStyle=rgb(PAPER);c.fillRect(0,0,cv.width,cv.height);
+const R=streamOf('stock');
+for(let n=0;n<cv.width*cv.height/60;n++){const x=R()*cv.width,y=R()*cv.height;
+c.fillStyle=R()<.5?'rgba(255,255,255,.35)':'rgba(120,96,70,.07)';c.fillRect(x,y,R()*2+.5,R()*1.2+.4)}
+for(let n=0;n<cv.width*cv.height/9000;n++){c.strokeStyle='rgba(120,96,70,.08)';c.lineWidth=.6;
+const x=R()*cv.width,y=R()*cv.height,a=R()*TAU,L=3+R()*9;
+c.beginPath();c.moveTo(x,y);c.quadraticCurveTo(x+Math.cos(a+.6)*L*.5,y+Math.sin(a+.6)*L*.5,x+Math.cos(a)*L,y+Math.sin(a)*L);c.stroke()}
+sheet={canvas:cv,b}}
+
+/* ---- bake cache ---- */
+const baked=new Map();
+function layer(name,variant,bucket){
+const key=name+'|'+variant+'|'+bucket+'|'+dpr;
+let e=baked.get(key);if(e)return e;
+if(typeof rm[name]!=='function'){e={absent:true};baked.set(key,e);return e}
+const ratio=Math.min(bucket*dpr,4);
+const cv=document.createElement('canvas');
+cv.width=Math.ceil(RW*ratio);cv.height=Math.ceil(RH*ratio);
+const c=cv.getContext('2d');
+c.setTransform(ratio,0,0,ratio,-B.x0*ratio,-B.y0*ratio);
+const H=mkHand({ctx:c,boil:variant});
+const m0=MARKS;
+try{rm[name].call(rm,H,streamOf(rm.id,name))}catch(err){console.error(rm.id+' '+name+' '+err.message)}
+e={canvas:cv,marks:MARKS-m0};baked.set(key,e);return e}
+
+/* ---- camera ---- */
+const toWorld=(x,y)=>({x:cam.x+(x-W/2)/cam.zoom,y:cam.y+(y-Hh/2)/cam.zoom});
+function fit(){cam.x=(B.x0+B.x1)/2;cam.y=(B.y0+B.y1)/2;
+cam.zoom=clamp(Math.min((W-40)/RW,(Hh-40)/RH),MINZ,MAXZ)}
+function aim(){
+if(qs.has('zoom'))cam.zoom=clamp(parseFloat(qs.get('zoom')),MINZ,MAXZ);
+const f=(qs.get('focus')||'').split(',').map(Number);
+if(f.length>=2&&f.every(Number.isFinite)){cam.x=isoX(f[0],f[1]);cam.y=isoY(f[0],f[1],f[2]||0)}}
+function resize(){
+dpr=Math.min(2,window.devicePixelRatio||1);
+W=window.innerWidth;Hh=window.innerHeight;
+stage.width=rm.__embed?1:Math.round(W*dpr);stage.height=rm.__embed?1:Math.round(Hh*dpr);
+stage.style.width=W+'px';stage.style.height=Hh+'px';
+baked.clear();fit();aim()}
+
+/* ---- the frame ---- */
+/* the room itself, into a context that is already positioned. frame(), the
+   contact sheet and the audit all go through here, so they cannot disagree. */
+function drawScene(c,t,boil,bucket){
+const u=fract(t/CYCLE)*CYCLE;
+const under=layer('under',boil,bucket);
+if(under.canvas)c.drawImage(under.canvas,B.x0,B.y0,RW,RH);
+const H=mkHand({ctx:c,boil});
+const R=streamOf(rm.id,'live',boil);
+if(typeof rm.live==='function'){try{rm.live.call(rm,H,R,t,u)}catch(err){console.error(rm.id+' live '+err.message)}}
+const items=H.pieces.map(p=>({key:p.key,run:()=>p.fn(H)}));
+(rm.figures||[]).forEach((fig,k)=>{
+try{
+const s2=FIGURES.state(fig,t);if(s2.hidden)return;
+const [x,y]=H.p(s2.i,s2.j,s2.z),gz=fig.groundZ??s2.groundZ??0;
+items.push({key:s2.i+s2.j+s2.z*.001,run:()=>FIGURES.draw(H,streamOf(rm.id,'fig',k,boil),
+{...s2,who:fig.who,x,y,t,scale:fig.scale??FIGURES.SCALE,ground:H.p(s2.i,s2.j,gz)})})
+}catch(err){console.error(rm.id+' figure '+k+' '+err.message)}});
+items.sort((a,b)=>a.key-b.key);
+for(const it of items){try{it.run()}catch(err){console.error(rm.id+' piece '+err.message)}}
+const over=layer('over',boil,bucket);
+if(over.canvas)c.drawImage(over.canvas,B.x0,B.y0,RW,RH);
+return {pieces:H.pieces.length,items:items.length}}
+
+const CYCLE=rm.cycle||18;
+const BOIL_FPS=rm.boilFps??7;
+let t0=performance.now();
+function frame(now){
+requestAnimationFrame(frame);
+const t=typeof globalThis.T==='number'?globalThis.T:(frozenT!==null?frozenT:(now-t0)/1000);
+const boil=Math.floor(t*BOIL_FPS)%3;
+const bucket=bucketFor(cam.zoom);
+ctx.setTransform(dpr,0,0,dpr,0,0);
+ctx.fillStyle='#17140f';ctx.fillRect(0,0,W,Hh);
+if(SHEET){drawContactSheet();return}
+ctx.save();
+ctx.translate(W/2,Hh/2);ctx.scale(cam.zoom,cam.zoom);ctx.translate(-cam.x,-cam.y);
+/* paper, with a drop shadow so it reads as a physical sheet */
+if(!sheet)buildSheet();
+ctx.fillStyle='rgba(8,6,4,.38)';
+ctx.fillRect(sheet.b.x0+16,sheet.b.y0+22,sheet.b.x1-sheet.b.x0,sheet.b.y1-sheet.b.y0);
+ctx.drawImage(sheet.canvas,sheet.b.x0,sheet.b.y0,sheet.b.x1-sheet.b.x0,sheet.b.y1-sheet.b.y0);
+drawScene(ctx,t,boil,bucket);
+ctx.restore()}
+
+/* ?sheet=6 renders six beats of the loop side by side. One screenshot instead
+   of six navigations — use it instead of stepping ?t= by hand. */
+let SHEET=qs.has('sheet')?clamp(parseInt(qs.get('sheet'))||6,2,12):0;
+function drawContactSheet(){
+const cols=Math.ceil(Math.sqrt(SHEET)),rows=Math.ceil(SHEET/cols);
+const tw=W/cols,th=Hh/rows,k=Math.min(tw/RW,th/RH)*.94;
+for(let idx=0;idx<SHEET;idx++){
+const t=CYCLE*idx/SHEET+.02,cx2=(idx%cols)*tw,cy2=Math.floor(idx/cols)*th;
+ctx.save();ctx.beginPath();ctx.rect(cx2,cy2,tw,th);ctx.clip();
+ctx.fillStyle=rgb(PAPER);ctx.fillRect(cx2,cy2,tw,th);
+ctx.translate(cx2+tw/2,cy2+th/2);ctx.scale(k,k);ctx.translate(-(B.x0+B.x1)/2,-(B.y0+B.y1)/2);
+drawScene(ctx,t,0,BUCKETS[0]);
+ctx.restore();
+ctx.fillStyle='rgba(28,30,45,.9)';ctx.font='600 12px ui-monospace,SFMono-Regular,monospace';
+ctx.fillText('t='+t.toFixed(2),cx2+9,cy2+17)}}
+
+/* ?audit=1 answers the checklist in text, so you do not have to look at it.
+   Reads back as globalThis.AUDIT. */
+function runAudit(){
+const mk=()=>{const cv=document.createElement('canvas');
+cv.width=Math.ceil(RW);cv.height=Math.ceil(RH);
+const c=cv.getContext('2d',{willReadFrequently:true});
+c.fillStyle=rgb(PAPER);c.fillRect(0,0,cv.width,cv.height);
+c.setTransform(1,0,0,1,-B.x0,-B.y0);return {cv,c}};
+/* Two checks, because they need different instruments.
+   Props and live drawing: compare pixels, with figures suppressed — halftone
+   dithering makes a figure that moved half a pixel look like a catastrophe.
+   Figures: compare their state directly. Exact, and no false positives. */
+const figsSaved=rm.figures;rm.figures=[];
+const a=mk(),b=mk(),ctrl=mk();
+drawScene(a.c,.02,0,BUCKETS[0]);                       // warm the bakes first
+const baked0=(layer('under',0,BUCKETS[0]).marks||0)+(layer('over',0,BUCKETS[0]).marks||0);
+MARKS=0;const shape=drawScene(a.c,.02,0,BUCKETS[0]);
+const marks=baked0+MARKS;
+drawScene(b.c,CYCLE-.02,0,BUCKETS[0]);            // end of the loop
+drawScene(ctrl.c,CYCLE+.02,0,BUCKETS[0]);         // one whole cycle on: same u, different raw t
+const A=a.c.getImageData(0,0,a.cv.width,a.cv.height).data;
+const Z=b.c.getImageData(0,0,b.cv.width,b.cv.height).data;
+const C=ctrl.c.getImageData(0,0,ctrl.cv.width,ctrl.cv.height).data;
+/* A genuine break is spatially clustered — a stack of paper that never got
+   cleared. Sub-second flicker (cursors, LEDs, dust) is scattered thin and is
+   allowed. So bucket the differing pixels into cells and report the hot ones. */
+/* Two comparisons, so flicker can be subtracted out:
+     A = start of loop vs end of loop   -> real breaks AND allowed flicker
+     B = start of loop vs one cycle on  -> same u, different raw t: flicker only
+   Cells hot in A but not in B are genuine. Everything else is a blinking cursor. */
+const CW=32,cols=Math.ceil(a.cv.width/CW),rows2=Math.ceil(a.cv.height/CW);
+const cA=new Int32Array(cols*rows2),cB=new Int32Array(cols*rows2);
+const hit=(P,Q,i)=>Math.abs(P[i]-Q[i])+Math.abs(P[i+1]-Q[i+1])+Math.abs(P[i+2]-Q[i+2])>24;
+let diff=0;const px=A.length/4;
+for(let q=0;q<px;q++){const i=q*4,x=q%a.cv.width,y=(q/a.cv.width)|0,cell=((y/CW)|0)*cols+((x/CW)|0);
+if(hit(A,Z,i)){diff++;cA[cell]++}
+if(hit(A,C,i))cB[cell]++}
+const loopDiffPct=+(100*diff/px).toFixed(3);
+const hot=[];
+for(let c2=0;c2<cA.length;c2++){const net=cA[c2]-cB[c2];
+if(net>40){const cx3=(c2%cols)*CW+CW/2+B.x0,cy3=((c2/cols)|0)*CW+CW/2+B.y0;
+hot.push({i:+(cx3/64+cy3/32).toFixed(1),j:+(cy3/32-cx3/64).toFixed(1),px:net})}}
+hot.sort((p,q)=>q.px-p.px);
+rm.figures=figsSaved;
+const eff=s2=>s2.blend&&s2.blend.w>.5?s2.blend.clip:s2.clip;
+const figureLoop=[];
+(rm.figures||[]).forEach((fig,k)=>{
+let s0,s1;try{s0=FIGURES.state(fig,.02);s1=FIGURES.state(fig,CYCLE-.02)}catch(e){return}
+const d=[];
+const move=Math.hypot(s1.i-s0.i,s1.j-s0.j);
+if(move>.06)d.push('ends '+move.toFixed(2)+' units from where it starts');
+if(Math.abs((s1.z||0)-(s0.z||0))>.06)d.push('ends at a different height');
+if(s1.face!==s0.face)d.push('faces '+s1.face+' at the end, '+s0.face+' at the start');
+if(eff(s0)!==eff(s1))d.push("clip '"+eff(s1)+"' at the end, '"+eff(s0)+"' at the start");
+if(!!s1.hidden!==!!s0.hidden)d.push('visibility differs');
+if(d.length)figureLoop.push({figure:k,who:fig.who,issues:d})});
+globalThis.AUDIT={room:rm.id,cycle:CYCLE,marks,
+figures:(rm.figures||[]).length,livePieces:shape.pieces,depthSorted:shape.items,
+loopDiffPct,
+loopCloses:hot.length===0&&figureLoop.length===0,
+propBreaksAt:hot.slice(0,5),
+figureBreaks:figureLoop,
+density:marks>=2400?'ok':marks>=1600?'thin':'sparse',
+errors:ERRORS.slice(0,8),errorCount:ERRORS.length,
+resources:performance.getEntriesByType('resource').length};
+return globalThis.AUDIT}
+
+/* ---- pointer ---- */
+const pointers=new Map();let drag=null,pinch=null;
+stage.addEventListener('pointerdown',e=>{e.preventDefault();stage.setPointerCapture(e.pointerId);
+pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});drag={x:e.clientX,y:e.clientY};
+if(pointers.size===2){const [a,b]=[...pointers.values()];
+pinch={d:Math.hypot(a.x-b.x,a.y-b.y),zoom:cam.zoom,anchor:toWorld((a.x+b.x)/2,(a.y+b.y)/2)}}
+stage.classList.add('drag')});
+stage.addEventListener('pointermove',e=>{if(!pointers.has(e.pointerId))return;
+pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+if(pointers.size>=2&&pinch){const [a,b]=[...pointers.values()],x=(a.x+b.x)/2,y=(a.y+b.y)/2;
+cam.zoom=clamp(pinch.zoom*Math.hypot(a.x-b.x,a.y-b.y)/Math.max(1,pinch.d),MINZ,MAXZ);
+cam.x=pinch.anchor.x-(x-W/2)/cam.zoom;cam.y=pinch.anchor.y-(y-Hh/2)/cam.zoom;return}
+if(!drag)return;cam.x-=(e.clientX-drag.x)/cam.zoom;cam.y-=(e.clientY-drag.y)/cam.zoom;
+drag={x:e.clientX,y:e.clientY}});
+const up=e=>{pointers.delete(e.pointerId);drag=null;pinch=null;stage.classList.remove('drag')};
+stage.addEventListener('pointerup',up);stage.addEventListener('pointercancel',up);
+stage.addEventListener('wheel',e=>{e.preventDefault();
+const a=toWorld(e.clientX,e.clientY),d=e.deltaY*(e.deltaMode===1?16:1);
+cam.zoom=clamp(cam.zoom*Math.exp(-clamp(d,-600,600)*.0015),MINZ,MAXZ);
+cam.x=a.x-(e.clientX-W/2)/cam.zoom;cam.y=a.y-(e.clientY-Hh/2)/cam.zoom},{passive:false});
+if(!rm.__embed)addEventListener('keydown',e=>{const k=e.key.toLowerCase();
+if(k==='0'){fit();e.preventDefault()}
+else if(k==='='||k==='+'){cam.zoom=clamp(cam.zoom*1.2,MINZ,MAXZ);e.preventDefault()}
+else if(k==='-'){cam.zoom=clamp(cam.zoom/1.2,MINZ,MAXZ);e.preventDefault()}});
+addEventListener('resize',resize);
+resize();if(!rm.__embed)requestAnimationFrame(frame);
+if(qs.has('audit'))setTimeout(()=>{try{runAudit()}catch(e){globalThis.AUDIT={fatal:String(e)}}},60);
+/* set globalThis.T to a number from the console to freeze on a beat */
+/* Everything the query string does is also here, because a preview pane that
+   serves local files as data: URLs throws the query string away. Prefer these. */
+globalThis.STAGE={cam,fit,B,room:rm,drawScene,dropBakes:()=>baked.clear(),errors:ERRORS,
+audit:()=>runAudit(),
+sheet:(n=6)=>{SHEET=n?clamp(n,2,12):0;return SHEET?('contact sheet: '+SHEET+' beats'):'off'},
+at:t=>{globalThis.T=(typeof t==='number')?t:undefined;return globalThis.T},
+look:(i,j,z,zoom)=>{cam.x=isoX(i,j);cam.y=isoY(i,j,z||0);if(zoom)cam.zoom=clamp(zoom,MINZ,MAXZ);return {...cam}}};
+return globalThis.STAGE}
+
+
+/* ==========================================================================
+   OFFICE BUILDING · FLOOR 4 of 4 — THE TOP FLOOR
+   "A meeting room with a big window wall, where someone on a video call
+    waves to the rest of the building. Two people."
+
+   One building: THE SHELL block below is identical in f1 ... f4. Up here
+   the windows look over the roofs across the street, so the same three
+   windows are nearly all sky.
+
+   BEAT SHEET (cycle 15 s) ..................... TOP
+     0.0  she types at the meeting table; the wall screen is dark; her
+          colleague stands at the window with a coffee
+     1.0  she joins the call: the wall screen wakes, her own picture first
+     1.6  the lobby joins ... 2.2 payroll ... 2.8 the team floor (party hat)
+     3.2  she talks
+     5.4  she waves at the camera — at the rest of the building
+     5.9  and the three floors wave back, one after another
+     7.6  she talks again
+     9.0  at the window: one sip of coffee
+    10.8  a wave goodbye
+    12.0  the floors drop off the call one by one; 13.3 the screen is dark
+    13.3  back to typing. the loop closes
+
+   LAYER TABLE
+     U  THE SHELL (plate, walls in section, windows over the roofs, sun on
+        the floor, pilasters, riser, lift); carpet, rug; sideboard with coffee
+        machine, cups, jug, fruit; clock face, thermostat; two prints;
+        planter trough; tall plant; shelves by the riser; the wall screen
+        (dark), camera, soundbar; media cabinet with the call hub; flip chart
+        on its easel; the far-side chairs and the end chair; two armchairs,
+        low table, lamp, a bag; scuffs
+     L  what is on the wall screen (tiles joining, waving, dropping off);
+        the laptop's light on her; clock second hand; dust in the sun
+     O  the meeting table and everything on it; the three chairs on our side
+   ========================================================================== */
+/* ======================= THE SHELL — begin ======================= */
+/* Identical, byte for byte, in room-office-f1.js ... f4.js. A floor passes in
+   only its height above the street (the view) and which lamp is lit over the
+   lift. Vary the interior; never the shell. */
+const SHELL={w:12,d:6,wall:3.0,
+wth:.30,                       // wall thickness: brick outer leaf + plaster
+slabTh:.55,                    // the concrete floor plate
+win:[2.30,6.00,9.70],winW:2.20,winZ:.80,winH:1.80,  // ne facade: three windows
+pil:[4.15,7.85],               // a pilaster on each pier
+lift:{j:3.00,w:1.15,h:2.20},   // the core: lift door on the nw wall
+riser:[.26,.46],               // services riser, nw wall, floor to floor
+sun:[.30,.95]};                // floor offset per unit of window height (i, j)
+
+/* the floor plate: a thick concrete edge with its aggregate showing */
+function shellSlab(H,R,rm){
+const S=SHELL,w=rm.w,d=rm.d,th=S.slabTh,t=S.wth;
+const top=slab(H,R,rm,{th,ink:'paper',tone:0,edgeInk:'blue',edgeTone:.34});
+const se2=H.faceJ(w,-t,t,-th,0),sw2=H.faceI(-t,d,t,-th,0);
+H.fill(se2,'blue',.34);H.fill(sw2,'blue',.21);
+const SE=H.faceJ(w,-t,d+t,-th,0),SW=H.faceI(-t,d,w+t,-th,0);
+H.speckle(R,SE,'blue',60,.45,1.1,.6);H.speckle(R,SW,'blue',110,.45,1.1,.6);
+H.speckle(R,SE,'paper',30,.4,1,1);H.speckle(R,SW,'paper',55,.4,1,1);
+H.tint(H.faceJ(w,-t,d+t,-th,-th+.11),'blue',.24);H.tint(H.faceI(-t,d,w+t,-th,-th+.11),'blue',.20);
+H.line(R,[H.p(w,-t,-.10),H.p(w,d,-.10),H.p(-t,d,-.10)],'blue',.8,{tone:.5,amp:.1});
+for(const p of[2.0,4.0])H.line(R,[H.p(w,p,-.10),H.p(w,p,-th+.11)],'blue',.7,{tone:.45,amp:.04});
+for(const p of S.pil)H.line(R,[H.p(p,d,-.10),H.p(p,d,-th+.11)],'blue',.7,{tone:.45,amp:.04});
+H.outline(R,SE,'blue',1,{tone:.85,amp:.2});H.outline(R,SW,'blue',1,{tone:.85,amp:.2});
+return top}
+
+/* the sun through the three windows, lying on the floor */
+function shellLight(H,R){
+const S=SHELL,[ki,kj]=S.sun;
+for(const c of S.win){const a=c-S.winW/2,b=c+S.winW/2,z0=S.winZ,z1=S.winZ+S.winH;
+const q=(p,z)=>H.p(p+z*ki,z*kj,.006);
+const P=[q(a,z0),q(b,z0),q(b,z1),q(a,z1)];
+H.tint(P,'sun',.24);H.grad(P,'sun',.14,0,q(c,z0),q(c,z1),6);
+H.tint([q(c-.05,z0),q(c+.05,z0),q(c+.05,z1),q(c-.05,z1)],'blue',.08);
+H.tint([q(a,2.10),q(b,2.10),q(b,2.20),q(a,2.20)],'blue',.07)}}
+
+/* what the windows see. one street, continuous behind all three windows:
+   from the lobby you look at the buildings opposite; from the top floor,
+   over their roofs. `level` is the floor, 1..4. */
+const VIEW={
+near:[[-1.2,1.9,3.05,'coral',.40],[2.1,4.6,3.55,'sun',.42],[4.8,6.9,2.40,'teal',.30],
+      [7.1,9.9,3.30,'coral',.30],[10.1,13.2,2.65,'sun',.30]],
+far:[[-1,1.2,2.25],[1.4,2.4,2.75],[2.6,4.4,2.05],[4.6,5.4,2.90],[5.6,7.8,2.20],
+     [8.0,9.0,2.60],[9.2,11.4,2.10],[11.6,13,2.45]],
+trees:[.5,3.9,7.3,10.9],
+clouds:[[1.6,2.38,6],[5.3,2.22,8],[8.9,2.46,6.5],[11.1,2.04,5],[3.4,1.78,5],[7.2,1.58,4.5]]};
+function shellView(H,R,P,a,b,level){
+const L=level-1,g=.21,z0=SHELL.winZ,z1=SHELL.winZ+SHELL.winH,c=(a+b)/2;
+const Q=(p0,p1,q0,q1)=>wallRect(H,'ne',p0,p1,q0,q1,g),pt=(p,z)=>wallPt(H,'ne',p,z,g);
+const vis=(p0,p1)=>p1>a-.1&&p0<b+.1;
+H.grad(P,'blue',.22,.04,pt(c,z1),pt(c,z0),7);
+for(const [p,z,s] of VIEW.clouds){if(!vis(p-1,p+1))continue;const [x,y]=pt(p,z-L*.10);cloud(H,R,x,y,s)}
+/* the far skyline sinks slowly as you climb */
+for(const [p0,p1,zt] of VIEW.far){if(!vis(p0,p1))continue;const top=zt-L*.30;
+const F=Q(p0,p1,z0-.5,top);H.fill(F,'blue',.17);H.outline(R,F,'blue',.6,{tone:.32,amp:.08});
+for(let z=top-.22;z>z0-.1;z-=.30)for(let p=p0+.14;p<p1-.1;p+=.26){const [x,y]=pt(p,z);H.knock(rect(x-1.2,y-1.6,x+1.2,y+.8))}}
+/* the street trees, lobby and first floor only */
+for(const p of VIEW.trees){const top=2.05-L*1.10;if(top<z0-.1||!vis(p-.9,p+.9))continue;
+H.line(R,[pt(p,top-.6),pt(p,z0-.5)],'blue',2.4,{tone:.7,amp:.1});
+const [x,y]=pt(p,top-.32),TR=streamOf('tree',p*10|0),T=blobAt(TR,x,y,27,15);
+H.fill(T,'teal',.46);H.speckle(TR,T,'teal',26,.8,1.8,.9);H.outline(R,T,'blue',.8,{tone:.6,amp:.25})}
+/* the buildings across the street: a floor up, their roofs drop a floor */
+VIEW.near.forEach(([p0,p1,zt,ink,tone],n)=>{if(!vis(p0,p1))return;const top=zt-L*1.10;if(top<z0-.3)return;
+const B=Q(p0,p1,z0-.5,top);H.fill(B,ink,tone);
+H.fill(Q(p0-.05,p1+.05,top-.08,top),ink,Math.min(.9,tone+.25));
+for(let z=top-.34;z>z0-.4;z-=.46)for(let p=p0+.22;p<p1-.3;p+=.44)H.fill(Q(p,p+.2,z-.24,z),'blue',.5);
+if(n===1){const T=Q(3.0,3.5,top,top+.34);H.fill(T,'coral',.5);H.outline(R,T,'blue',.7,{tone:.7})}
+if(n===3)H.line(R,[pt(8.6,top),pt(8.6,top+.55)],'blue',.9,{tone:.8,amp:.05});
+H.outline(R,B,'blue',.8,{tone:.6,amp:.1})});
+if(L===0){H.line(R,[pt(5.85,z0-.5),pt(5.85,2.05)],'blue',1.4,{tone:.8,amp:.05});
+const [x,y]=pt(5.85,2.08);H.fill(ell(x,y,4,2),'sun',.8)}
+if(L===3)for(const [p,z] of[[7.7,2.30],[8.05,2.42],[1.3,2.1]]){const [x,y]=pt(p,z);
+H.line(R,[[x-3,y-1.5],[x,y],[x+3,y-1.5]],'blue',.8,{tone:.8,amp:.05})}}
+
+function shellWindow(H,R,c,level){
+const S=SHELL,a=c-S.winW/2,b=c+S.winW/2,z0=S.winZ,z1=S.winZ+S.winH,g=.20;
+const O=wallRect(H,'ne',a,b,z0,z1,0),G=wallRect(H,'ne',a,b,z0,z1,g);
+H.clip(O,()=>{
+H.fill(O,'blue',.10);
+H.clip(G,()=>shellView(H,R,G,a,b,level));
+/* sun on the glass */
+for(const [p,wd] of[[a+.35,.16],[a+.62,.07]]){const Sq=[wallPt(H,'ne',p,z0,g),wallPt(H,'ne',p+wd,z0,g),wallPt(H,'ne',p+wd+.5,z1,g),wallPt(H,'ne',p+.5,z1,g)];
+H.opacity(.22,()=>H.knock(Sq))}
+H.outline(R,G,'blue',1.1,{tone:.85,amp:.08});
+H.line(R,[wallPt(H,'ne',c,z0,g),wallPt(H,'ne',c,z1,g)],'blue',1.7,{tone:.85,amp:.05});
+H.line(R,[wallPt(H,'ne',a,2.15,g),wallPt(H,'ne',b,2.15,g)],'blue',1.2,{tone:.8,amp:.05});
+/* the left reveal shows the wall is thick */
+const J=H.faceJ(a,-g,g,z0,z1);H.fill(J,'paper',1);H.tint(J,'blue',.16);H.outline(R,J,'blue',.7,{tone:.6,amp:.05})});
+const sill=H.tile(a-.06,-g,S.winW+.12,g+.12,z0);H.fill(sill,'paper',1);H.tint(sill,'sun',.18);
+const sf=H.faceI(a-.06,.12,S.winW+.12,z0-.05,z0);H.fill(sf,'paper',1);H.tint(sf,'blue',.22);
+H.outline(R,sill,'blue',.8,{tone:.75,amp:.1});
+H.outline(R,O,'blue',1.2,{tone:.9,amp:.12})}
+
+/* the core: a lift, the same door on every floor */
+function shellLift(H,R,floor,live){
+const L=SHELL.lift,j0=L.j-L.w/2,j1=L.j+L.w/2;
+const F=wallRect(H,'nw',j0-.14,j1+.14,0,L.h+.14,-.01);
+H.fill(F,'blue',.40);H.outline(R,F,'blue',1.1,{tone:.9,amp:.12});
+const O=wallRect(H,'nw',j0,j1,0,L.h,-.02);
+H.fill(O,'blue',.80);
+H.clip(O,()=>{
+const back=H.faceJ(-1.3,j0,L.w,0,L.h);H.fill(back,'blue',.44);
+const side=H.faceI(-1.3,j0,1.3,0,L.h);H.fill(side,'blue',.55);
+const fl=H.tile(-1.3,j0,1.3,L.w,0);H.fill(fl,'sun',.34);
+H.line(R,[H.p(-1.3,j0,.95),H.p(0,j0,.95)],'paper',1.3,{tone:.8,amp:.04});
+const [gx,gy]=H.p(-.65,L.j,L.h);H.glow(gx,gy,30,9,'sun',.6)});
+H.outline(R,O,'blue',1,{tone:.85,amp:.1});
+if(!live){liftDoors(H,R,0);liftLamp(H,R,floor);liftCall(H,R,0)}}
+function liftDoors(H,R,open){
+const L=SHELL.lift,j0=L.j-L.w/2,j1=L.j+L.w/2,hw=L.w/2*(1-open);
+for(const [p0,p1] of[[j0,j0+hw],[j1-hw,j1]]){if(p1-p0<.01)continue;
+const D=wallRect(H,'nw',p0,p1,0,L.h,-.03);H.fill(D,'teal',.30);
+H.line(R,[wallPt(H,'nw',p0+.07,.12,-.035),wallPt(H,'nw',p0+.07,L.h-.12,-.035)],'paper',1.1,{tone:.7,amp:.03});
+H.outline(R,D,'blue',.9,{tone:.85,amp:.06})}}
+function liftLamp(H,R,lit){
+const L=SHELL.lift,P=wallRect(H,'nw',L.j-.34,L.j+.34,L.h+.20,L.h+.36,-.03);
+H.fill(P,'blue',.82);H.outline(R,P,'blue',.8,{amp:.05});
+for(let k=1;k<=4;k++){const [x,y]=wallPt(H,'nw',L.j+.36-k*.144,L.h+.28,-.04);
+if(k===lit){H.dot(x,y,2.1,'sun',1,{knock:true});H.glow(x,y,7,5,'sun',.45)}
+else H.dot(x,y,1.3,'paper',1,{knock:true})}}
+function liftCall(H,R,lit){
+const L=SHELL.lift,jc=L.j+L.w/2+.34,P=wallRect(H,'nw',jc-.09,jc+.09,1.02,1.36,-.03);
+H.fill(P,'paper',1);H.tint(P,'blue',.25);H.outline(R,P,'blue',.8,{amp:.05});
+const [x,y]=wallPt(H,'nw',jc,1.19,-.04);
+H.dot(x,y,2,lit>.5?'sun':'paper',1,{knock:true});H.outline(R,circ(x,y,2),'blue',.6,{amp:0});
+if(lit>.02)H.glow(x,y,8,6,'sun',.45*lit)}
+
+/* the walls, in section where the building is cut open */
+function shellWalls(H,R,rm,o={}){
+const S=SHELL,w=rm.w,d=rm.d,h=S.wall,t=S.wth,IN=.07;
+backWalls(H,R,rm,h,{ink:'paper',tone:1,ink2:'sun',tone2:.10,style:'plain',th:t});
+/* painted dado to sill height, a picture rail over the windows, skirting */
+for(const side of['ne','nw']){const len=side==='ne'?w:d;
+H.tint(wallRect(H,side,0,len,0,S.winZ,0),'teal',.08);
+H.line(R,[wallPt(H,side,0,S.winZ),wallPt(H,side,len,S.winZ)],'blue',.9,{tone:.5,amp:.12});
+H.line(R,[wallPt(H,side,0,2.78),wallPt(H,side,len,2.78)],'blue',.8,{tone:.42,amp:.12});
+H.fill(wallRect(H,side,0,len,0,.12,-.01),'blue',.34)}
+/* the cut: wall caps and both open ends. brick outer leaf, plaster face */
+const brick=P=>{H.fill(P,'coral',.52);H.hatch(R,P,'blue',4.2,-.9,.55,{tone:.45,amp:.1})};
+brick([H.p(-t,-t,h),H.p(w,-t,h),H.p(w,-IN,h),H.p(-t,-IN,h)]);
+brick([H.p(-t,-IN,h),H.p(-t,d,h),H.p(-IN,d,h),H.p(-IN,-IN,h)]);
+H.fill([H.p(-IN,-IN,h),H.p(w,-IN,h),H.p(w,0,h),H.p(-IN,0,h)],'paper',1);
+H.fill([H.p(-IN,0,h),H.p(-IN,d,h),H.p(0,d,h),H.p(0,0,h)],'paper',1);
+H.outline(R,[H.p(-t,-t,h),H.p(w,-t,h),H.p(w,0,h),H.p(0,0,h),H.p(0,d,h),H.p(-t,d,h)],'blue',1,{tone:.9,amp:.15});
+{const B=H.faceJ(w,-t,t-IN,0,h),Pl=H.faceJ(w,-IN,IN,0,h);
+H.fill(B,'coral',.52);H.tint(B,'blue',.30);H.fill(Pl,'paper',1);H.tint(Pl,'blue',.22);
+for(let z=.25,k=0;z<h;z+=.25,k++){H.line(R,[H.p(w,-t,z),H.p(w,-IN,z)],'paper',.7,{tone:.8,amp:.03});
+const jp=-t+(k%2?.08:.16);H.line(R,[H.p(w,jp,z-.25),H.p(w,jp,z)],'paper',.6,{tone:.7,amp:.03})}
+H.outline(R,H.faceJ(w,-t,t,0,h),'blue',1,{tone:.9,amp:.1})}
+{const B=H.faceI(-t,d,t-IN,0,h),Pl=H.faceI(-IN,d,IN,0,h);
+H.fill(B,'coral',.52);H.tint(B,'blue',.16);H.fill(Pl,'paper',1);H.tint(Pl,'blue',.12);
+for(let z=.25,k=0;z<h;z+=.25,k++){H.line(R,[H.p(-t,d,z),H.p(-IN,d,z)],'paper',.7,{tone:.8,amp:.03});
+const ip=-t+(k%2?.08:.16);H.line(R,[H.p(ip,d,z-.25),H.p(ip,d,z)],'paper',.6,{tone:.7,amp:.03})}
+H.outline(R,H.faceI(-t,d,t,0,h),'blue',1,{tone:.9,amp:.1})}
+/* windows */
+for(const c of S.win)shellWindow(H,R,c,o.level||1);
+/* pilasters: concrete, cut at the top like the plate */
+for(const p of S.pil){
+boxAt(H,R,p-.17,0,.34,.22,0,h,['paper',1],{shadow:false,topInk:'blue',topTone:.34,half:.07,full:.20,lw:1});
+H.grad(H.faceI(p-.17,.22,.34,0,.7),'blue',.14,0,H.p(p,.22,0),H.p(p,.22,.7),4)}
+/* services riser: runs through every floor at the same place */
+for(const [jp,wd] of[[S.riser[0],5.4],[S.riser[1],3.4]]){
+const A=wallPt(H,'nw',jp,0,-.12),B=wallPt(H,'nw',jp,h,-.12);
+H.line(R,[A,B],'blue',wd,{tone:.52,amp:.04});
+H.line(R,[[A[0]-wd*.18,A[1]],[B[0]-wd*.18,B[1]]],'paper',wd*.22,{tone:.55,amp:.04});
+for(const z of[.35,1.25,2.15]){const C=wallPt(H,'nw',jp,z,-.13);H.fill(ell(C[0],C[1],wd*.72,wd*.36),'blue',.8)}}
+{const [vx,vy]=wallPt(H,'nw',S.riser[0],1.05,-.2);H.fill(circ(vx,vy,4.2),'coral',.7);
+H.outline(R,circ(vx,vy,4.2),'blue',.8,{amp:.1});H.line(R,[[vx-3,vy],[vx+3,vy]],'blue',.8,{amp:0})}
+/* cable tray along the top of the facade wall */
+pipeRun(H,R,'ne',.30,11.80,2.90,{off:-.05,w:2.2,tone:.40});
+shellLift(H,R,o.floor||1,!!o.liftLive)}
+
+/* motes in the sun. raw t, periods that do not divide any cycle */
+function shellDust(H,t,n=5){
+const S=SHELL,[ki,kj]=S.sun,DR=streamOf('shell','dust');
+H.at(1.2,0,0,HH=>{for(const c of S.win)for(let k=0;k<n;k++){
+const p=c+rd(DR,-1.0,1.0),zz=rd(DR,S.winZ,S.winZ+S.winH),sp=rd(DR,.045,.10),ph=fract(t*sp+rd(DR,0,1));
+const f=lerp(.15,.85,ph),[x,y]=HH.p(p+f*zz*ki,f*zz*kj+Math.sin(t*.37+k)*.05,zz*(1-f));
+HH.dot(x,y,rd(DR,.5,1.1),'sun',(1-Math.abs(ph*2-1))*.75)}})}
+
+/* SPRITES: furniture a figure passes behind, baked once per boil variant and
+   scale, then blitted under one H.at key. Static furniture is never redrawn
+   in live. Their ink marks still count toward STAGE.audit's total. */
+const SPRITES=new Map();
+function boxBB(H,i,j,w,d,z0,z1,pad=16){
+const P=[];for(const a of[i,i+w])for(const b of[j,j+d])for(const z of[z0,z1])P.push(H.p(a,b,z));
+const [x0,y0,x1,y1]=bbox(P);return [x0-pad,y0-pad,x1+pad,y1+pad]}
+function sprite(HH,name,bb,draw){
+const c=HH.ctx(),m=c.getTransform(),s=Math.hypot(m.a,m.b);
+const ratio=[.5,.75,1,1.5,2,2.25,3,4].find(r=>r>=s-1e-3)||4;
+const key=name+'|'+HH.variant+'|'+ratio;
+let e=SPRITES.get(key);
+if(!e){const cv=document.createElement('canvas');
+cv.width=Math.max(1,Math.ceil((bb[2]-bb[0])*ratio));cv.height=Math.max(1,Math.ceil((bb[3]-bb[1])*ratio));
+const c2=cv.getContext('2d');c2.setTransform(ratio,0,0,ratio,-bb[0]*ratio,-bb[1]*ratio);
+const H2=mkHand({ctx:c2,boil:HH.variant}),m0=MARKS;
+try{draw(H2,streamOf('sprite',name))}catch(err){console.error('sprite '+name+' '+err.message)}
+e={cv,marks:MARKS-m0,w:cv.width/ratio,h:cv.height/ratio};SPRITES.set(key,e)}
+c.drawImage(e.cv,bb[0],bb[1],e.w,e.h);MARKS+=e.marks}
+
+/* walk a polyline between two beats at constant speed. phase = distance / 0.8 */
+const faceOf=(di,dj)=>Math.abs(di)>=Math.abs(dj)?(di>=0?'se':'nw'):(dj>=0?'sw':'ne');
+function walkOn(pts,t0,t1,u){
+const L=[0];for(let k=1;k<pts.length;k++)L.push(L[k-1]+Math.hypot(pts[k][0]-pts[k-1][0],pts[k][1]-pts[k-1][1]));
+const tot=L[L.length-1],s=clamp((u-t0)/(t1-t0),0,1)*tot;
+let k=1;while(k<pts.length-1&&L[k]<s)k++;
+const a=pts[k-1],b=pts[k],f=clamp((s-L[k-1])/((L[k]-L[k-1])||1),0,1);
+return {i:lerp(a[0],b[0],f),j:lerp(a[1],b[1],f),face:faceOf(b[0]-a[0],b[1]-a[1]),phase:s/.8}}
+/* a clip sequence: [[t0,clip],...]; each clip blends into the next over r s */
+function seq(u,t,S,DUR,r=.4){
+let k=S.length-1;while(k>0&&u<S[k][0])k--;
+const cur=S[k][1],nx=k+1<S.length?S[k+1]:null;
+const w=nx?sstep(nx[0]-r,nx[0],u):0;
+const out={clip:cur,phase:t/(DUR[cur]||3)};
+if(w>.001)out.blend={clip:nx[1],phase:t/(DUR[nx[1]]||3),w};
+return out}
+const SCALE=1.45,SEATZ=FIGURES.seatZ('adult',SCALE);
+const SEAT={drop:.47,ll:84,lr:80,kl:-84,kr:-80};
+/* ======================= THE SHELL — end ========================= */
+
+/* ---- 1. THE CLOCK ---- */
+const TOP={cycle:15,
+join:1.0,tiles:[1.6,2.2,2.8],talk:3.2,wave:5.4,waveEnd:7.6,back:[5.9,6.2,6.5],backEnd:7.9,
+talk2:7.6,sip:9.0,sipEnd:10.4,bye:10.8,byeEnd:11.8,drop:[12.0,12.3,12.6],off:12.8,offEnd:13.3};
+const clock=t=>fract(t/TOP.cycle)*TOP.cycle;
+
+/* ---- named positions ---- */
+const AT={
+table:{i:3.40,j:2.20,w:4.40,d:1.10},
+caller:[6.20,1.86],watcher:[9.95,1.02],
+tv:{j0:3.95,j1:5.85,z0:1.05,z1:2.15},
+media:{i:.24,j:4.10,w:.45,d:1.60,h:.55},
+easel:[1.55,4.75],
+sideboard:{i:1.25,j:.26,w:2.10,d:.46,h:.78},
+laptop:[6.00,2.28],
+};
+
+/* ---- 2. CLIPS ---- */
+FIGURES.clip('x-talk',2.4,[[0,{...SEAT,lean:4,head:-4,al:40,ar:58,el:66,er:50}],[.5,{...SEAT,lean:5,head:-2,al:44,ar:74,el:60,er:30,y:-.3}],[1,{...SEAT,lean:4,head:-4,al:40,ar:58,el:66,er:50}]]);
+FIGURES.clip('x-wave',1.1,[
+[0  ,{...SEAT,lean:3,head:-8,al:42,ar:142,el:62,er:26}],
+[.25,{...SEAT,lean:3,head:-8,al:42,ar:160,el:62,er:-24}],
+[.5 ,{...SEAT,lean:3,head:-8,al:42,ar:142,el:62,er:26}],
+[.75,{...SEAT,lean:3,head:-8,al:42,ar:160,el:62,er:-24}],
+[1  ,{...SEAT,lean:3,head:-8,al:42,ar:142,el:62,er:26}]]);
+FIGURES.clip('y-hold',5,[[0,{lean:1,head:-6,al:14,ar:40,el:24,er:108,ll:-3,lr:5}],[.5,{lean:2,head:-9,al:14,ar:42,el:24,er:110,ll:-2,lr:6,y:-.25}],[1,{lean:1,head:-6,al:14,ar:40,el:24,er:108,ll:-3,lr:5}]]);
+FIGURES.clip('y-sip',1.4,[[0,{lean:3,head:-12,al:14,ar:46,el:24,er:138}],[.5,{lean:4,head:-14,al:14,ar:48,el:24,er:142}],[1,{lean:3,head:-12,al:14,ar:46,el:24,er:138}]]);
+const DUR={type:.5,'x-talk':2.4,'x-wave':1.1,'y-hold':5,'y-sip':1.4,idle:3};
+
+/* ---- furniture ---- */
+function chairAt(H,R,ci,cj,back,o={}){
+const s=.30,z=SEATZ,[fx,fy]=H.p(ci,cj,.04);
+shadowAt(H,...H.p(ci+.08,cj+.08,0),17,8,.18);
+boxAt(H,R,ci-.05,cj-.05,.10,.10,0,z-.08,['blue',.75],{lw:.6,shadow:false});
+for(let k=0;k<5;k++){const a=k/5*TAU+(o.turn||0);
+H.line(R,[[fx,fy],[fx+Math.cos(a)*13,fy+Math.sin(a)*6.5]],'blue',1.6,{tone:.8,amp:.1})}
+boxAt(H,R,ci-s,cj-s,2*s,2*s,z-.08,.08,[o.ink||'teal',o.tone??.55],{lw:.8,shadow:false});
+if(back==='nw')boxAt(H,R,ci-s,cj-s,.08,2*s,z,.58,[o.ink||'teal',(o.tone??.55)+.08],{lw:.8,shadow:false});
+if(back==='ne')boxAt(H,R,ci-s,cj-s,2*s,.08,z,.58,[o.ink||'teal',(o.tone??.55)+.08],{lw:.8,shadow:false});
+if(back==='sw')boxAt(H,R,ci-s,cj+s-.08,2*s,.08,z,.58,[o.ink||'teal',(o.tone??.55)+.08],{lw:.8,shadow:false})}
+function armchairAt(H,R,i,j,ink,tone){
+shadowBox(H,i,j,.9,.85,0,.7,.2);
+boxAt(H,R,i,j,.9,.85,.08,.34,[ink,tone],{lw:.9,shadow:false});
+boxAt(H,R,i,j,.9,.16,.42,.42,[ink,tone+.08],{lw:.8,shadow:false});
+boxAt(H,R,i,j+.16,.14,.69,.42,.16,[ink,tone+.05],{lw:.7,shadow:false});
+boxAt(H,R,i+.76,j+.16,.14,.69,.42,.16,[ink,tone+.05],{lw:.7,shadow:false});
+for(const [a,b] of[[i+.06,j+.06],[i+.78,j+.06],[i+.06,j+.74],[i+.78,j+.74]])boxAt(H,R,a,b,.06,.06,0,.08,['blue',.8],{shadow:false,lw:.4})}
+
+/* the wall screen's call: the three floors below, and her own picture */
+const TILES=[
+{bg:'teal',tone:.42,shirt:'teal',hair:'bun'},     // f1, the lobby
+{bg:'coral',tone:.40,shirt:'coral',hair:'short'}, // f2, payroll
+{bg:'sun',tone:.50,shirt:'coral',hair:'hat'},     // f3, the birthday
+{bg:'blue',tone:.30,shirt:'sun',hair:'short'}];   // her own picture
+function callScreen(H,R,u,t){
+const C=TOP,T=AT.tv,on=sstep(C.join,C.join+.4,u)*(1-sstep(C.off,C.offEnd,u));if(on<=.01)return;
+const S=H.faceJ(.05,T.j0+.07,T.j1-T.j0-.14,T.z0+.07,T.z1-.07),q=(a,b)=>lerpP(lerpP(S[3],S[2],a),lerpP(S[0],S[1],a),b);
+H.opacity(on,()=>{H.fill(S,'blue',.62);
+TILES.forEach((tl,k)=>{const a0=(k%2)*.5+.02,b0=(k>>1)*.5+.03,a1=a0+.46,b1=b0+.44;
+const inn=k<3?sstep(C.tiles[k],C.tiles[k]+.25,u)*(1-sstep(C.drop[k],C.drop[k]+.25,u)):sstep(C.join+.2,C.join+.5,u);
+if(inn<=.01)return;
+const Q=[q(a0,b0),q(a1,b0),q(a1,b1),q(a0,b1)];
+H.opacity(inn,()=>{H.fill(Q,tl.bg,tl.tone);
+H.clip(Q,()=>{const c=centroid(Q),hx=c[0],hy=c[1]-1.5;
+H.fill(ell(hx,hy+8.5,7,4.5),tl.shirt,.7);H.fill(circ(hx,hy,3.6),'coral',.35);
+if(tl.hair==='bun'){H.fill(arcPts(hx,hy,3.8,3.8,Math.PI,TAU,6),'blue',.85);H.fill(circ(hx,hy-4.6,1.6),'blue',.85)}
+else if(tl.hair==='hat'){H.fill(arcPts(hx,hy,3.8,3.8,Math.PI,TAU,6),'blue',.85);H.fill([[hx-2.6,hy-3],[hx+2.6,hy-3],[hx+.6,hy-10]],'sun',.9)}
+else H.fill(arcPts(hx,hy,3.8,3.8,Math.PI,TAU,6),'sun',.8);
+/* they wave back */
+const wv=k<3?sstep(C.back[k],C.back[k]+.2,u)*(1-sstep(C.backEnd,C.backEnd+.3,u)):sstep(C.wave,C.wave+.2,u)*(1-sstep(C.waveEnd,C.waveEnd+.3,u))+sstep(C.bye,C.bye+.2,u)*(1-sstep(C.byeEnd,C.byeEnd+.3,u));
+if(wv>.02){const a=-1.25+.35*Math.sin(t*11+k)*wv,L=7*wv;H.line(R,[[hx+4.5,hy+6],[hx+4.5+Math.cos(a)*L,hy+6+Math.sin(a)*L]],tl.shirt,2,{tone:.8,amp:0});
+H.fill(circ(hx+4.5+Math.cos(a)*L,hy+6+Math.sin(a)*L,1.4),'coral',.4)}});
+H.outline(R,Q,'paper',.5,{tone:.5,amp:0})})});
+const [cx,cy]=centroid(S);H.light(cx,cy,40,26,.10)})}
+
+/* ========================================================================== */
+const ROOM={
+id:'office-f4',
+w:SHELL.w,d:SHELL.d,wall:SHELL.wall,
+cycle:TOP.cycle,
+
+/* ======================== UNDER ======================== */
+under(H,R){
+const w=this.w,d=this.d;
+shellSlab(H,R,this);
+/* soft carpet, a rug under the table */
+{const T=H.tile(0,0,w,d,0);H.fill(T,'coral',.12);
+H.clip(T,()=>{for(let p=.5;p<w;p+=.5)H.line(R,H.path([[p,0],[p,d]]),'coral',.5,{tone:.16,amp:.1});})}
+shellLight(H,R);
+shellWalls(H,R,this,{level:4,floor:4});
+rug(H,R,2.90,1.10,5.40,3.10,'sun',.20,{border:'teal'});
+
+/* ---------- NE wall ---------- */
+/* the sideboard under window 1: coffee, cups, a jug, fruit */
+{const S=AT.sideboard;boxAt(H,R,S.i,S.j,S.w,S.d,0,S.h,['sun',.42],{topInk:'paper',topTone:1,lw:1});
+for(const p of[.7,1.4]){const [x0,y0]=H.p(S.i+p,S.j+S.d,.06),[x1,y1]=H.p(S.i+p,S.j+S.d,.72);H.line(R,[[x0,y0],[x1,y1]],'blue',.7,{tone:.6,amp:.02})}
+for(const p of[.55,.85,1.25,1.55]){const [x,y]=H.p(S.i+p,S.j+S.d,.42);H.dot(x,y,1.3,'blue',.85,{knock:true})}
+boxAt(H,R,S.i+.12,S.j+.06,.40,.34,S.h,.44,['blue',.62],{topInk:'blue',topTone:.75,lw:.8,shadow:false});
+{const [x,y]=H.p(S.i+.32,S.j+.40,S.h+.12);H.fill(rect(x-2,y-4,x+2,y),'paper',1);H.dot(x+5,y-9,1.2,'teal',.9,{knock:true})}
+scatterOn(H,R,H.tile(S.i+.65,S.j+.06,.70,.34,S.h),5,(x,y,k,RR)=>mugAt(H,R,x,y,pk(RR,['paper','teal','coral']),.5,.7),.9);
+{const [x,y]=H.p(S.i+1.55,S.j+.24,S.h);const J=[[x-4,y],[x+4,y],[x+3.5,y-12],[x-3.5,y-12]];H.fill(J,'blue',.18);H.outline(R,J,'blue',.8,{amp:.05});H.fill([[x-3.6,y-4],[x+3.6,y-4],[x+3.8,y],[x-3.8,y]],'blue',.3)}
+{const [x,y]=H.p(S.i+1.88,S.j+.24,S.h);H.fill(ell(x,y,7,3),'teal',.5);H.outline(R,ell(x,y,7,3),'blue',.7);
+for(const [dx,dy,ink] of[[-3,-2,'sun'],[1,-3,'coral'],[3,-1,'sun']])H.dot(x+dx,y+dy,2.2,ink,.8,{knock:true})}}
+/* pier 1: the clock and a thermostat; pier 2: a big print */
+{const [cx,cy]=wallPt(H,'ne',4.62,2.05,-.03);this.clock=[cx,cy];
+const face=circ(cx,cy,9.5,26);H.fill(face,'paper',1);H.outline(R,face,'blue',1.3,{amp:.12});
+for(let k=0;k<12;k++){const a=k/12*TAU;H.dot(cx+Math.cos(a)*7.2,cy+Math.sin(a)*7.2,k%3?.5:.95,'blue',.85)}
+const a1=(-.25+12.3/12)*TAU,a2=(-.25+18/60)*TAU;
+H.line(R,[[cx,cy],[cx+Math.cos(a1)*4.4,cy+Math.sin(a1)*4.4]],'blue',1.7,{amp:.05});
+H.line(R,[[cx,cy],[cx+Math.cos(a2)*6.6,cy+Math.sin(a2)*6.6]],'blue',1.3,{amp:.05});
+const TH=wallRect(H,'ne',3.55,3.80,1.35,1.60,-.02);H.fill(TH,'paper',1);H.outline(R,TH,'blue',.7,{amp:.05});H.dot(...centroid(TH),1.6,'coral',.8)}
+{const F=frameOn(H,R,'ne',7.38,1.15,.46,.95,{ink:'paper',tone:1});const q=(a,b)=>lerpP(lerpP(F[3],F[2],a),lerpP(F[0],F[1],a),b);
+H.fill([q(.15,.2),q(.85,.2),q(.85,.55),q(.15,.55)],'teal',.45);H.fill(circ(...q(.6,.62),4),'coral',.7);H.line(R,[q(.1,.85),q(.9,.72)],'blue',.8,{tone:.6,amp:.1});
+const F2=frameOn(H,R,'ne',8.30,1.30,.44,.60,{ink:'sun',tone:.45})}
+/* a planter trough along window 2, behind the table */
+{boxAt(H,R,5.05,.24,1.90,.34,0,.48,['blue',.40],{topInk:'blue',topTone:.6,lw:.9});
+for(const [ii,s] of[[5.30,.55],[5.80,.62],[6.30,.50],[6.75,.58]]){const [x,y]=H.p(ii,.41,.48);plant(H,R,x,y+2,s,{pot:'blue',potTone:.4,n:6})}}
+/* the last pier: a tall plant */
+{const [x,y]=H.p(11.40,.62,0);shadowAt(H,x+4,y+2,16,7,.2);plant(H,R,x,y,1.2,{pot:'coral',potTone:.55,n:11})}
+
+/* ---------- NW wall ---------- */
+/* shelves of this and that by the riser */
+{shelvingAt(H,R,.25,.72,.48,1.45,1.70,3,(z,r,RR)=>{
+if(r===1)booksAlong(H,R,'j',.28,.78,1.30,z,.40,{w0:.08,w1:.14,h0:.24,h1:.34,gap:.1});
+else if(r===0){stackOf(H,R,.30,.80,.38,.45,z,6,P=>{H.fill(P,'paper',1);H.outline(R,P,'blue',.5,{tone:.5})});const [x,y]=H.p(.48,1.75,z);bottleAt(H,R,x,y,.6,'teal',.4)}
+else{const [x,y]=H.p(.48,1.10,z);plant(H,R,x,y,.45,{pot:'sun',potTone:.6,n:5});const [bx,by]=H.p(.48,1.75,z);H.fill(circ(bx,by-5,4.5),'coral',.55);H.outline(R,circ(bx,by-5,4.5),'blue',.7)}},
+{ink:'blue',tone:.5,topInk:'coral'})}
+/* the wall screen, dark until the call: bezel, camera, soundbar */
+{const T=AT.tv,B=wallRect(H,'nw',T.j0,T.j1,T.z0,T.z1,-.04);H.fill(B,'blue',.92);H.outline(R,B,'blue',1.2,{amp:.05});
+const S=H.faceJ(.05,T.j0+.07,T.j1-T.j0-.14,T.z0+.07,T.z1-.07);H.tint(S,'teal',.10);
+H.opacity(.18,()=>H.knock([lerpP(S[3],S[2],.1),lerpP(S[3],S[2],.3),lerpP(S[0],S[1],.18),lerpP(S[0],S[1],0)]));
+const [cx,cy]=wallPt(H,'nw',(T.j0+T.j1)/2,T.z1-.03,-.06);H.dot(cx,cy,1.2,'paper',1,{knock:true});
+const SB=wallRect(H,'nw',T.j0+.3,T.j1-.3,T.z0-.16,T.z0-.07,-.06);H.fill(SB,'blue',.8);
+H.clip(SB,()=>{for(let p=T.j0+.34;p<T.j1-.3;p+=.06){const [x,y]=wallPt(H,'nw',p,T.z0-.115,-.07);H.dot(x,y,.5,'paper',1,{knock:true})}})}
+/* media cabinet under it: the call hub, remotes, a plant */
+{const M=AT.media;boxAt(H,R,M.i,M.j,M.w,M.d,0,M.h,['coral',.40],{topInk:'sun',topTone:.25,lw:1});
+for(const f of[.33,.66]){const [x0,y0]=H.p(M.i+M.w,M.j+M.d*f,.06),[x1,y1]=H.p(M.i+M.w,M.j+M.d*f,.50);H.line(R,[[x0,y0],[x1,y1]],'blue',.7,{tone:.6,amp:.02})}
+boxAt(H,R,M.i+.08,M.j+.25,.30,.30,M.h,.06,['blue',.72],{shadow:false,lw:.6});
+{const [x,y]=H.p(M.i+.23,M.j+.40,M.h+.06);H.dot(x,y,1.5,'teal',.9,{knock:true})}
+for(const [jj,a] of[[4.85,.3],[5.05,-.2]]){const [x,y]=H.p(M.i+.22,jj,M.h);H.fill(rotPts(rect(x-5,y-1.5,x+5,y+1.5),x,y,a),'blue',.75)}
+{const [x,y]=H.p(M.i+.22,M.j+1.40,M.h);plant(H,R,x,y,.5,{pot:'paper',potTone:1,n:6})}
+cableBetween(H,R,wallPt(H,'nw',4.9,AT.tv.z0,-.02),H.p(M.i+.1,4.9,M.h),6,{w:1,tone:.6})}
+
+/* ---------- the floor ---------- */
+/* the flip chart on its easel, front left: last meeting's scribble */
+{const [ei,ej]=AT.easel;shadowAt(H,...H.p(ei+.1,ej+.1,0),16,6,.18);
+const legs=[[ei-.25,ej-.18],[ei+.25,ej-.18],[ei,ej+.30]];
+for(const [a,b] of legs)H.line(R,[H.p(a,b,0),H.p(ei,ej,1.85)],'blue',1.6,{tone:.8,amp:.03});
+const P=H.faceJ(ei+.02,ej-.40,.80,1.00,1.75);H.fill(P,'paper',1);H.outline(R,P,'blue',1,{amp:.05});
+const q=(a,b)=>lerpP(lerpP(P[3],P[2],a),lerpP(P[0],P[1],a),b);
+H.line(R,[q(.1,.8),q(.3,.55),q(.5,.62),q(.72,.3),q(.9,.2)],'coral',1.3,{amp:.1});
+for(let k=0;k<4;k++)H.fill([q(.12+k*.2,.9),q(.24+k*.2,.9),q(.24+k*.2,.9-.12-k*.08),q(.12+k*.2,.9-.12-k*.08)],'teal',.55);
+H.line(R,[q(.1,.12),q(.55,.12)],'blue',.9,{tone:.6,amp:.05});
+H.fill(H.faceJ(ei+.02,ej-.42,.84,1.72,1.80),'blue',.7);
+for(let k=0;k<3;k++){const S=H.faceJ(ei+.03,ej-.36+k*.07,.10,1.62-k*.05,1.74);H.fill(S,'paper',1);H.outline(R,S,'blue',.4,{tone:.4,amp:0})}}
+/* the far-side chairs: hers, and two pushed in */
+chairAt(H,R,AT.caller[0],AT.caller[1]-.24,'ne',{ink:'teal',tone:.50});
+chairAt(H,R,4.40,1.78,'ne',{ink:'teal',tone:.45,turn:.3});
+chairAt(H,R,7.55,1.72,'ne',{ink:'teal',tone:.45,turn:.8});
+chairAt(H,R,3.02,2.72,'nw',{ink:'teal',tone:.45,turn:.5});
+/* the lounge corner: two armchairs, a low table, a lamp */
+armchairAt(H,R,9.45,3.85,'teal',.40);armchairAt(H,R,10.75,4.35,'coral',.40);
+{boxAt(H,R,10.20,5.15,.55,.55,0,.40,['sun',.45],{topInk:'paper',topTone:1,lw:.9});
+const [x,y]=H.p(10.47,5.42,.40);mugAt(H,R,x,y,'teal',.6,.8);
+stackOf(H,R,10.26,5.20,.30,.24,.40,3,(P,k)=>{H.fill(P,k%2?'coral':'paper',.45);H.outline(R,P,'blue',.5,{tone:.5})},.02)}
+{const [x,y]=H.p(11.55,3.70,0);shadowAt(H,x+3,y+1,10,4,.2);H.line(R,[[x,y],[x,y-52]],'blue',1.6,{tone:.85,amp:.03});
+H.fill(ell(x,y,6,2.5),'blue',.7);lamp(H,R,x,y-52,1,{ink:'sun',tone:.7})}
+{const [x,y]=H.p(11.00,4.70,.52);const bag=loop([[x-7,y],[x-5,y-10],[x+5,y-10],[x+7,y]],2);H.fill(bag,'blue',.55);H.outline(R,bag,'blue',.9,{amp:.2})}
+/* wear */
+{const D=streamOf('top','wear'),FL=H.tile(0,0,w,d,.004);scuffOn(H,R,FL,12,{r0:9,r1:24,tone:.05});
+for(const [wi,wj] of[[8.6,1.6],[9.6,1.5],[5.2,1.3]]){const [x,y]=H.p(wi,wj,.005);H.tint(blobAt(D,x,y,24,12),'blue',.045)}
+const [px,py]=H.p(2.4,3.9,.004);H.fill(blobAt(D,px,py,4,2.6),'paper',1);H.outline(R,blobAt(D,px,py,4,2.6),'blue',.5,{tone:.6})}
+},
+
+/* ======================== LIVE ======================== */
+live(H,R,t,u){
+/* the clock's second hand */
+{const [cx,cy]=this.clock;H.at(4.62,0,2.05,HH=>{const a=-.25*TAU+fract(u/7.5)*TAU;
+HH.line(R,[[cx,cy],[cx+Math.cos(a)*7.4,cy+Math.sin(a)*7.4]],'coral',.8,{amp:.04});HH.dot(cx,cy,1.2,'blue',1)})}
+/* the wall screen */
+H.at(.05,AT.tv.j0,0,HH=>callScreen(HH,R,u,t));
+/* her laptop's light on her, while the call is up */
+const on=sstep(TOP.join,TOP.join+.4,u)*(1-sstep(TOP.off,TOP.offEnd,u));
+if(on>.02)H.at(AT.caller[0]+.01,AT.caller[1],2,HH=>{const [x,y]=HH.p(AT.laptop[0]+.2,AT.laptop[1],1.0);HH.light(x,y,26,16,.12*on)});
+shellDust(H,t,5);
+},
+
+/* ======================== OVER ======================== */
+/* the meeting table and the chairs on our side of it: nobody passes in front */
+over(H,R){
+const T=AT.table;
+shadowBox(H,T.i,T.j,T.w,T.d,0,.75,.16);
+for(const [a,b] of[[T.i+.3,T.j+.3],[T.i+T.w-.4,T.j+.3],[T.i+.3,T.j+T.d-.4],[T.i+T.w-.4,T.j+T.d-.4]])boxAt(H,R,a,b,.1,.1,0,.72,['blue',.72],{shadow:false,lw:.6});
+boxAt(H,R,T.i,T.j,T.w,T.d,.72,.06,['paper',1],{topInk:'teal',topTone:.22,half:.12,full:.28,lw:1.1,shadow:false});
+const zt=.78;
+/* her laptop, lid towards her */
+{const [li,lj]=AT.laptop;const B=H.tile(li,lj,.46,.32,zt);H.fill(B,'paper',1);H.tint(B,'blue',.18);H.outline(R,B,'blue',.7,{amp:.04});
+const L=H.faceI(li,lj+.32,.46,zt,zt+.30);H.fill(L,'blue',.62);H.outline(R,L,'blue',.8,{amp:.04});H.dot(...centroid(L),1.3,'paper',1,{knock:true})}
+/* the speakerphone in the middle, glasses, a jug, notebooks, pens, a plant */
+{const [x,y]=H.p(5.2,2.78,zt);const S=[[x-9,y],[x,y-5],[x+9,y],[x,y+5]];H.fill(S,'blue',.72);H.outline(R,S,'blue',.8,{amp:.04});H.dot(x,y-1,1.4,'teal',.9,{knock:true})}
+{const [x,y]=H.p(4.35,2.55,zt);const J=[[x-4,y],[x+4,y],[x+3.5,y-12],[x-3.5,y-12]];H.fill(J,'blue',.16);H.outline(R,J,'blue',.8,{amp:.05});H.fill([[x-3.6,y-4],[x+3.6,y-4],[x+3.8,y],[x-3.8,y]],'blue',.28)}
+for(const [gi,gj] of[[4.0,3.0],[4.9,3.05],[6.6,2.9],[7.2,2.55]]){const [x,y]=H.p(gi,gj,zt);const G=[[x-2.6,y],[x+2.6,y],[x+3,y-7],[x-3,y-7]];H.fill(G,'blue',.12);H.outline(R,G,'blue',.6,{amp:.03})}
+paperAt(H,R,3.75,2.55,.36,.42,zt+.002,{ink:'coral',tone:.35,lines:3});
+paperAt(H,R,6.75,2.60,.34,.40,zt+.002,{lines:4});
+paperAt(H,R,4.55,2.95,.30,.26,zt+.002,{ink:'sun',tone:.3,lines:2});
+{const [x,y]=H.p(6.05,2.95,zt);H.line(R,[[x-5,y+1],[x+5,y-2]],'coral',1.2,{amp:0});H.line(R,[[x-4,y+3],[x+6,y+1]],'blue',1.2,{amp:0})}
+{const [x,y]=H.p(5.75,2.60,zt);plant(H,R,x,y,.5,{pot:'paper',potTone:1,n:6})}
+{const [x,y]=H.p(7.45,2.95,zt);mugAt(H,R,x,y,'coral',.6,.8);H.outline(R,ell(x-9,y+3,4,1.8),'coral',.6,{tone:.35,amp:.2})}
+/* chairs on our side, turned in to the table */
+for(const [ci,cj,turn,ink] of[[4.30,3.72,.2,'teal'],[5.75,3.80,.9,'coral'],[7.05,3.70,.5,'teal']])chairAt(H,R,ci,cj,'sw',{ink,tone:.45,turn});
+{const [jx,jy]=H.p(5.75,4.05,1.0);const jk=loop([[jx-8,jy-8],[jx+8,jy-10],[jx+9,jy+6],[jx,jy+9],[jx-8,jy+5]],2);H.fill(jk,'blue',.5);H.outline(R,jk,'blue',.9,{amp:.2})}
+},
+
+/* ======================== THE CAST ======================== */
+figures:[
+/* 1 — on the call: joins, talks, waves to the rest of the building, says bye */
+{who:'adult',at:[AT.caller[0],AT.caller[1],SEATZ],groundZ:SEATZ,face:'sw',clip:'type',scale:SCALE,
+ opts:{shirt:['sun',.62],pants:['blue',.72],skin:['coral',.58,'blue',.16],hair:['coral',.82],hairStyle:'curly',shoe:['blue',.9]},
+ move:t=>{const u=clock(t),C=TOP;
+ return seq(u,t,[[0,'type'],[C.talk,'x-talk'],[C.wave,'x-wave'],[C.talk2,'x-talk'],[C.bye,'x-wave'],[C.byeEnd,'x-talk'],[C.offEnd,'type']],DUR,.35)}},
+
+/* 2 — at the window with a coffee. one sip */
+{who:'adult',at:[AT.watcher[0],AT.watcher[1],0],face:'ne',clip:'y-hold',scale:SCALE,
+ opts:{shirt:['blue',.55],pants:['blue',.78],skin:['coral',.32],hair:['sun',.78],hairStyle:'pony',shoe:['coral',.7],
+ prop:(H,R,pts)=>{const [x,y]=pts.b.rha;const M=rect(x-2.6,y-6.5,x+2.6,y);H.fill(M,'paper',1);H.tint(M,'teal',.45);H.outline(R,M,'blue',.7,{amp:0})}},
+ move:t=>{const u=clock(t),C=TOP;return seq(u,t,[[0,'y-hold'],[C.sip,'y-sip'],[C.sipEnd,'y-hold']],DUR,.4)}},
+]};
+
+mount(ROOM,document.getElementById("stage"));
+</script>
+</body>
+</html>
